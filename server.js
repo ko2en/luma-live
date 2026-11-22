@@ -61,7 +61,9 @@ const PALETTE = [
   '#fb7185', '#c084fc', '#60a5fa', '#facc15', '#2dd4bf'
 ];
 
-const clients = new Map(); // id -> { id, role, res, name, joinedAt }
+const SESSION_SECRET = crypto.randomBytes(32);
+const SSE_QUEUE_MAX = 256 * 1024;
+const clients = new Map(); // id -> { id, role, session, res, name, joinedAt }
 const chatLog = [];        // 最近 120 条
 let chatSeq = 0;
 /* 限速键是「连接」，不是昵称：换昵称绕不过去，连接断开后由宽限期清扫 */
@@ -111,6 +113,18 @@ function safeEqual(a, b) {
   try { return crypto.timingSafeEqual(x, y); } catch (err) { return false; }
 }
 
+function sessionOf(req, res) {
+  const cookie = String(req.headers.cookie || '').split(';').map((s) => s.trim())
+    .find((s) => s.startsWith('luma_session='));
+  const token = cookie ? cookie.slice('luma_session='.length) : '';
+  const match = /^([a-f0-9]{64})\.([a-f0-9]{64})$/.exec(token);
+  const sign = (id) => crypto.createHmac('sha256', SESSION_SECRET).update(id).digest('hex');
+  if (match && safeEqual(match[2], sign(match[1]))) return match[1];
+  const id = crypto.randomBytes(32).toString('hex');
+  res.setHeader('Set-Cookie', `luma_session=${id}.${sign(id)}; Path=/; HttpOnly; SameSite=Strict${req.socket.encrypted ? '; Secure' : ''}`);
+  return id;
+}
+
 function keyOk(candidate) {
   if (!STREAM_KEY) return true;
   return safeEqual(candidate, STREAM_KEY);
@@ -124,7 +138,7 @@ const authFails = new Map(); // ip -> { n, until, at }
 
 function ipOf(req) {
   if (TRUST_PROXY) {
-    const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',').pop().trim();
     if (xff) return xff;
   }
   return req.socket.remoteAddress || '?';
@@ -135,6 +149,7 @@ function authLockLeft(req) {
   const rec = authFails.get(ipOf(req));
   if (!rec) return 0;
   const left = rec.until - Date.now();
+  if (rec.until && left <= 0) authFails.delete(ipOf(req));
   return left > 0 ? left : 0;
 }
 
@@ -210,7 +225,13 @@ function clearHostGrace() {
 /* 主播掉线：先不判死，给 10 秒重连窗口 */
 function startHostGrace() {
   clearHostGrace();
-  if (!HOST_GRACE_MS) return;
+  if (!HOST_GRACE_MS) {
+    stream.live = false;
+    stream.startedAt = null;
+    broadcast('stream-ended', { reason: 'host-disconnected' });
+    broadcastState(true);
+    return;
+  }
   hostGraceUntil = Date.now() + HOST_GRACE_MS;
   hostGraceTimer = setTimeout(() => {
     hostGraceTimer = null;
@@ -254,22 +275,32 @@ function statePayload() {
   };
 }
 
+function writeSse(res, frame) {
+  if (res.destroyed || res.writableEnded) return false;
+  if (res.writableLength + Buffer.byteLength(frame) > SSE_QUEUE_MAX) {
+    res.destroy();
+    return false;
+  }
+  try {
+    res.write(frame);
+    return true;
+  } catch (err) {
+    res.destroy();
+    return false;
+  }
+}
+
 function sendTo(id, event, data) {
   const c = clients.get(id);
   if (!c) return false;
-  try {
-    c.res.write(`event: ${event}\ndata: ${JSON.stringify(data === undefined ? {} : data)}\n\n`);
-    return true;
-  } catch (err) {
-    return false;
-  }
+  return writeSse(c.res, `event: ${event}\ndata: ${JSON.stringify(data === undefined ? {} : data)}\n\n`);
 }
 
 function broadcast(event, data, exceptId) {
   const frame = `event: ${event}\ndata: ${JSON.stringify(data === undefined ? {} : data)}\n\n`;
   for (const c of clients.values()) {
     if (c.id === exceptId) continue;
-    try { c.res.write(frame); } catch (err) { /* noop */ }
+    writeSse(c.res, frame);
   }
 }
 
@@ -309,26 +340,39 @@ function json(res, code, obj, headers) {
 function readBody(req, limit = 96 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let settled = false;
     const chunks = [];
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      chunks.length = 0;
+      reject(err);
+    };
     req.on('data', (chunk) => {
+      if (settled) return;
       size += chunk.length;
       if (size > limit) {
-        reject(new Error('payload too large'));
+        fail(new Error('payload too large'));
         req.destroy();
         return;
       }
       chunks.push(chunk);
     });
     req.on('end', () => {
+      if (settled) return;
       const raw = Buffer.concat(chunks).toString('utf8');
-      if (!raw) return resolve({});
+      chunks.length = 0;
       try {
-        resolve(JSON.parse(raw));
+        const body = raw ? JSON.parse(raw) : {};
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('expected object');
+        settled = true;
+        resolve(body);
       } catch (err) {
-        reject(err);
+        fail(err);
       }
     });
-    req.on('error', reject);
+    req.on('error', fail);
+    req.on('aborted', () => fail(new Error('request aborted')));
   });
 }
 
@@ -343,9 +387,10 @@ function startHeartbeat() {
   if (heartbeat) return;
   heartbeat = setInterval(() => {
     for (const c of clients.values()) {
-      try { c.res.write(': ping\n\n'); } catch (err) { /* noop */ }
+      writeSse(c.res, ': ping\n\n');
     }
   }, 20000);
+  heartbeat.unref();
 }
 
 function handleEvents(req, res, url) {
@@ -354,6 +399,10 @@ function handleEvents(req, res, url) {
   const name = (url.searchParams.get('name') || '访客').slice(0, 24);
 
   if (!id) return json(res, 400, { error: 'missing id' });
+  const previous = clients.get(id);
+  if (previous && (previous.session !== req.session || previous.role !== role)) {
+    return json(res, 409, { error: 'id already in use' });
+  }
 
   /* host 身份必须凭口令取得，否则任何人都能抢走整个直播间。
      失败计入 IP 限速：爆破 5 次就锁 60 秒。 */
@@ -374,16 +423,15 @@ function handleEvents(req, res, url) {
     'X-Accel-Buffering': 'no'
   });
   if (res.flushHeaders) res.flushHeaders();
-  res.write(': connected\n\n');
+  writeSse(res, ': connected\n\n');
 
-  // 同一 id 重连：踢掉旧连接
-  const previous = clients.get(id);
+  // 同一会话、同一角色的 id 重连：踢掉旧连接
   if (previous) {
     try { previous.res.end(); } catch (err) { /* noop */ }
     clients.delete(id);
   }
 
-  clients.set(id, { id, role, res, name, joinedAt: Date.now() });
+  clients.set(id, { id, role, session: req.session, res, name, joinedAt: Date.now() });
 
   if (role === 'host') {
     // 换了一台设备/换了标签页开播：让旧的那个安静退场
@@ -421,8 +469,10 @@ function handleEvents(req, res, url) {
 
     const current = clients.get(id);
     const isCurrent = Boolean(current && current.res === res);
-    if (isCurrent) clients.delete(id);
-    if (lastChatAt.has(id)) lastChatAt.delete(id);
+    if (isCurrent) {
+      clients.delete(id);
+      lastChatAt.delete(`c:${id}`);
+    }
 
     if (role === 'host') {
       /* 已经被同 id 的新连接顶替：这条旧连接的关闭与直播状态无关 */
@@ -438,7 +488,7 @@ function handleEvents(req, res, url) {
     broadcastState();
   };
 
-  req.on('close', cleanup);
+  res.on('close', cleanup);
   req.on('error', cleanup);
   res.on('error', cleanup);
 }
@@ -448,13 +498,18 @@ function handleEvents(req, res, url) {
  * ------------------------------------------------------------------ */
 
 function serveStatic(req, res, url) {
-  let pathname = decodeURIComponent(url.pathname);
+  let pathname;
+  try { pathname = decodeURIComponent(url.pathname); } catch (err) {
+    return json(res, 400, { error: 'bad URI' });
+  }
+  if (pathname.includes('\0')) return json(res, 400, { error: 'bad URI' });
 
   if (pathname === '/' || pathname === '/index.html') pathname = '/index.html';
   else if (pathname === '/studio' || pathname === '/studio/') pathname = '/studio.html';
 
-  const filePath = path.join(PUBLIC_DIR, path.normalize(pathname).replace(/^(\.\.[\/\\])+/, ''));
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  const filePath = path.resolve(PUBLIC_DIR, `.${pathname}`);
+  const relative = path.relative(PUBLIC_DIR, filePath);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     res.writeHead(403).end('forbidden');
     return;
   }
@@ -524,12 +579,11 @@ async function handleApi(req, res, url) {
     const { from, to, data } = body || {};
     if (!from || !to || !data) return json(res, 400, { error: 'from/to/data required' });
 
-    /* 不信任请求体里的 from：必须是当前真实在线的连接，
-       from 由服务端认定后覆盖转发，伪造发信人这条路就断了。 */
+    /* from 必须属于当前浏览器会话；仅知道在线 id 不代表拥有连接。 */
     const fromId = String(from).slice(0, 64);
     const toId = String(to).slice(0, 64);
     const sender = clients.get(fromId);
-    if (!sender) return json(res, 403, { error: 'sender not connected' });
+    if (!sender || sender.session !== req.session) return json(res, 403, { error: 'sender not owned' });
 
     const target = clients.get(toId);
     if (!target) return json(res, 200, { delivered: false });
@@ -539,8 +593,8 @@ async function handleApi(req, res, url) {
       return json(res, 403, { error: 'signal direction not allowed' });
     }
 
-    sendTo(toId, 'signal', { from: sender.id, data });
-    return json(res, 200, { delivered: true });
+    const delivered = sendTo(toId, 'signal', { from: sender.id, data });
+    return json(res, 200, { delivered });
   }
 
   if (req.method === 'POST' && route === '/api/chat') {
@@ -555,6 +609,7 @@ async function handleApi(req, res, url) {
        没连着的（直连 API）只按 IP 限速，且永远拿不到「主播」标签。 */
     const clientId = String(body.clientId || body.id || '').slice(0, 64);
     const conn = clientId ? clients.get(clientId) : null;
+    if (conn && conn.session !== req.session) return json(res, 403, { error: 'sender not owned' });
     const role = conn && conn.role === 'host' ? 'host' : 'viewer';
     const shownName = role === 'host' ? (conn.name || 'Luma') : name;
 
@@ -603,7 +658,8 @@ async function handleApi(req, res, url) {
     }
 
     const id = String(body.id || '');
-    if (!id || id !== stream.hostId) {
+    const host = clients.get(id);
+    if (!id || id !== stream.hostId || !host || host.role !== 'host' || host.session !== req.session) {
       return json(res, 403, { error: '只有已连接的开播端可以操作' });
     }
 
@@ -651,7 +707,16 @@ async function handleApi(req, res, url) {
  * ------------------------------------------------------------------ */
 
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  let url;
+  try {
+    url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    decodeURIComponent(url.pathname);
+  } catch (err) {
+    return json(res, 400, { error: 'bad URI' });
+  }
+  req.session = sessionOf(req, res);
 
   if (url.pathname === '/api/events') {
     return handleEvents(req, res, url);
@@ -669,8 +734,8 @@ const server = http.createServer((req, res) => {
   serveStatic(req, res, url);
 });
 
-server.headersTimeout = 0;
-server.requestTimeout = 0;
+server.headersTimeout = 60000;
+server.requestTimeout = 30000;
 server.keepAliveTimeout = 65000;
 
 server.listen(PORT, '0.0.0.0', () => {

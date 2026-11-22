@@ -576,6 +576,7 @@
     if (pc.connectionState !== 'connected') return;
 
     sampling = true;
+    const sampledPeer = pc;
     let bytes = 0;
     let received = 0;
     let lost = 0;
@@ -583,7 +584,7 @@
     let relay = false;
 
     try {
-      const stats = await pc.getStats();
+      const stats = await sampledPeer.getStats();
       /* candidate-pair 与 local-candidate 必须在同一次 getStats 结果里关联，
          跨采样周期匹配会拿到上一次的候选对，判定就乱了。 */
       const byId = new Map();
@@ -600,20 +601,31 @@
         }
       });
 
-      /* 当前生效的候选对：Chrome 会标 selected，没有就挑已 nominated 的 */
+      /* 标准 transport.selectedCandidatePairId 优先；兼容旧浏览器的 selected/nominated。 */
       let pair = null;
       for (const r of byId.values()) {
+        if (r.type === 'transport' && r.selectedCandidatePairId) {
+          pair = byId.get(r.selectedCandidatePairId);
+          if (pair) break;
+        }
+      }
+      for (const r of pair ? [] : byId.values()) {
         if (r.type !== 'candidate-pair') continue;
         if (r.selected === true) { pair = r; break; }
         if (r.state === 'succeeded' && (r.nominated === true || (r.bytesReceived || 0) > 0)) pair = r;
       }
       const local = pair && pair.localCandidateId ? byId.get(pair.localCandidateId) : null;
-      relay = Boolean(local && local.candidateType === 'relay');
+      const remote = pair && pair.remoteCandidateId ? byId.get(pair.remoteCandidateId) : null;
+      // 任一端使用 relay 都会消耗 TURN 带宽，不能只看观众自己的候选。
+      relay = Boolean((local && local.candidateType === 'relay') || (remote && remote.candidateType === 'relay'));
+      if (pair && typeof pair.currentRoundTripTime === 'number') rtt = pair.currentRoundTripTime;
     } catch (err) {
       sampling = false;
       return;
     }
 
+    // 采样期间可能已重建连接，旧结果不能污染新连接的计数和档位。
+    if (pc !== sampledPeer) { sampling = false; return; }
     const now = performance.now();
     let kbps = 0;
     let loss = 0;
@@ -626,7 +638,7 @@
       const dLost = Math.max(0, lost - lastInbound.lost);
       loss = dRecv + dLost > 0 ? dLost / (dRecv + dLost) : 0;
 
-      if (bytes === lastInbound.bytes) {
+      if (bytes === lastInbound.bytes && !(state.muted && state.muted.video)) {
         stalledCount += 1;
         if (stalledCount >= 3) {
           stalledCount = 0;

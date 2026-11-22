@@ -22,9 +22,15 @@ function check(name, ok, extra) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? `  — ${extra}` : ''}`);
 }
 
+const cookies = new Map();
+function rememberCookie(res, port) {
+  const cookie = res.headers['set-cookie'];
+  if (cookie) cookies.set(port || PORT, cookie.map((s) => s.split(';')[0]).join('; '));
+}
+
 function req(method, pathname, body, headers, port) {
   return new Promise((resolve, reject) => {
-    const data = body ? JSON.stringify(body) : null;
+    const data = method === 'POST' && body !== undefined ? JSON.stringify(body) : null;
     const r = http.request(
       {
         host: '127.0.0.1',
@@ -32,11 +38,13 @@ function req(method, pathname, body, headers, port) {
         method,
         path: pathname,
         headers: Object.assign(
+          { Cookie: cookies.get(port || PORT) || '' },
           data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {},
           headers || {}
         )
       },
       (res) => {
+        rememberCookie(res, port);
         let buf = '';
         res.setEncoding('utf8');
         res.on('data', (c) => { buf += c; });
@@ -54,15 +62,16 @@ function req(method, pathname, body, headers, port) {
 }
 
 /* 建立 SSE 连接，收集事件 */
-function sse(query, port) {
+function sse(query, port, cookie) {
   return new Promise((resolve, reject) => {
     const events = [];
     const r = http.request({
       host: '127.0.0.1',
       port: port || PORT,
       path: `/api/events?${query}`,
-      headers: { Accept: 'text/event-stream' }
+      headers: { Accept: 'text/event-stream', Cookie: cookie === undefined ? (cookies.get(port || PORT) || '') : cookie }
     }, (res) => {
+      if (cookie === undefined) rememberCookie(res, port);
       if (res.statusCode !== 200) {
         let b = '';
         res.on('data', (c) => { b += c; });
@@ -143,6 +152,7 @@ async function testTurn() {
   const srv = spawnServer({
     PORT: String(port),
     STREAM_KEY: '',
+    HOST_GRACE_MS: '0',
     TURN_HOST: host,
     TURN_PORT: '3478',
     TURN_TLS_PORT: '5349',
@@ -180,6 +190,13 @@ async function testTurn() {
       check('credential 与 HMAC-SHA1 一致', turnEntry.credential === expect);
     }
     check('凭证不进客户端可见的其它字段', !flat.includes(secret));
+    const hostConn = await sse('role=host&id=zero-grace', port);
+    await hostConn.waitFor('welcome');
+    await req('POST', '/api/stream', { id: 'zero-grace', live: true }, null, port);
+    hostConn.close();
+    const ended = await viewer.waitFor('stream-ended');
+    const state = await req('GET', '/api/state', undefined, null, port);
+    check('零宽限主播断线立即结束', !!ended && state.body.live === false && state.body.hostReconnecting === false);
     viewer.close();
   } finally {
     srv.child.kill();
@@ -243,6 +260,27 @@ async function testTurn() {
     check('观众无需口令', viewer.status === 200 && !!vWelcome);
     check('观众收到 history', !!(await viewer.waitFor('history')));
 
+    const browserCookie = cookies.get(PORT);
+    const outsider = await req('GET', '/api/config', undefined, { Cookie: '' });
+    const outsiderCookie = cookies.get(PORT);
+    cookies.set(PORT, browserCookie);
+    check('会话 Cookie 为随机且 HttpOnly/SameSite=Strict', outsiderCookie !== browserCookie && /HttpOnly/.test(outsider.headers['set-cookie'][0]) && /SameSite=Strict/.test(outsider.headers['set-cookie'][0]));
+    const forgedSignal = await req('POST', '/api/signal', { from: 'host1', to: 'v1', data: { sdp: {} } }, { Cookie: outsiderCookie });
+    check('不同会话冒用真实 host id 发信令 → 403', forgedSignal.status === 403);
+    const forgedChat = await req('POST', '/api/chat', { clientId: 'host1', text: '冒充主播' }, { Cookie: outsiderCookie });
+    check('不同会话冒用真实 host id 聊天 → 403', forgedChat.status === 403);
+    const forgedStream = await req('POST', '/api/stream', { id: 'host1', key: KEY, live: true }, { Cookie: outsiderCookie });
+    check('不同会话持正确口令冒用 host 操作 → 403', forgedStream.status === 403);
+    const forgedSse = await sse(`role=host&id=host1&key=${KEY}`, PORT, outsiderCookie);
+    check('不同会话替换真实 host SSE → 409', forgedSse.status === 409);
+    const changedRole = await sse('role=viewer&id=host1');
+    check('相同会话改变在线 id 角色 → 409', changedRole.status === 409);
+    const original = await sse('role=viewer&id=reconnect&name=probe');
+    const replacement = await sse('role=viewer&id=reconnect&name=probe');
+    check('相同会话同角色 SSE 重连成功', original.status === 200 && replacement.status === 200);
+    original.close();
+    replacement.close();
+
     // ---- 4. 信令方向 ----
     const v2h = await req('POST', '/api/signal', { from: 'v1', to: 'host1', data: { candidate: { candidate: 'x' } } });
     check('观众 → 主播 允许', v2h.status === 200 && v2h.body.delivered === true);
@@ -258,7 +296,7 @@ async function testTurn() {
     const v2v = await req('POST', '/api/signal', { from: 'v1', to: 'v2', data: { candidate: {} } });
     check('观众 ↔ 观众 → 403', v2v.status === 403);
 
-    // 服务端覆盖 from：用 v1 的连接发，但 body.from 写 host1，应被拒（因为 v1 是 viewer，目标是 v2 viewer）
+    // 同角色方向仍被拒绝；真实在线 id 的跨会话冒用已在前面单独覆盖。
     const forgedDirection = await req('POST', '/api/signal', { from: 'v1', to: 'v2', data: { candidate: {} } });
     check('伪造方向无法绕过', forgedDirection.status === 403);
 
@@ -312,6 +350,24 @@ async function testTurn() {
     const studio = await req('GET', '/studio');
     check('开播台 200', studio.status === 200);
 
+    check('响应带 nosniff', home.headers['x-content-type-options'] === 'nosniff');
+    check('响应禁止 Referrer 泄露', home.headers['referrer-policy'] === 'no-referrer');
+    const malformed = await req('GET', '/%E0%A4%A');
+    check('畸形 URI → 400 且进程存活', malformed.status === 400 && (await req('GET', '/api/state')).status === 200);
+    const badHost = await req('GET', '/', undefined, { Host: '[' });
+    check('畸形 URL Host → 400', badHost.status === 400);
+    const traversal = await req('GET', '/%2e%2e%5cserver.js');
+    check('编码路径不能越界读取', traversal.status === 403 || traversal.status === 404);
+    for (const route of ['/api/auth', '/api/signal', '/api/chat', '/api/stream']) {
+      const invalid = await req('POST', route, null);
+      check(`${route} 的 null JSON → 400`, invalid.status === 400);
+    }
+    for (const body of [[], 'text', 7, true]) {
+      check(`非对象 JSON ${JSON.stringify(body)} → 400`, (await req('POST', '/api/chat', body)).status === 400);
+    }
+    const anonymous = await req('POST', '/api/chat', { text: '匿名仍兼容', role: 'host' });
+    check('无 id 匿名聊天兼容且不能指定主播身份', anonymous.status === 200 && anonymous.body.msg.role === 'viewer');
+
     // ---- 9. TURN 下发（另起一台带 TURN_* 的服务） ----
     await testTurn();
 
@@ -337,6 +393,13 @@ async function testTurn() {
     check('锁定期间 host SSE 也拒', lockedSse.status === 429);
 
     await sleep(LOCK_MS + 400);
+    for (let i = 1; i <= MAX_FAILS; i += 1) {
+      const retried = await req('POST', '/api/auth', { key: `retry-${i}` });
+      check(`锁定到期后第 ${i} 次错误仍允许尝试`, retried.status === 401);
+    }
+    const lockedAgain = await req('POST', '/api/auth', { key: KEY });
+    check('新一轮第 6 次才再次锁定', lockedAgain.status === 429);
+    await sleep(LOCK_MS + 200);
     const recovered = await req('POST', '/api/auth', { key: KEY });
     check('锁定期满 → 恢复 200', recovered.status === 200);
 

@@ -946,7 +946,9 @@
       pc.__goodStreak = 0;
       tunePeer(pc);
     } else {
-      pc.__goodStreak = (pc.__goodStreak || 0) + 1;
+      // 连续稳定必须是同一个目标档位，mid/high 交替不算稳定。
+      pc.__goodStreak = pc.__upgradeTarget === want ? (pc.__goodStreak || 0) + 1 : 1;
+      pc.__upgradeTarget = want;
       if (pc.__goodStreak >= 3) {
         pc.__tier = want;
         pc.__goodStreak = 0;

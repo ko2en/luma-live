@@ -1,6 +1,11 @@
 {
   "name": "luma-live",
-  "version": "1.1.0",
+  "version": "1.2.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ko2en/luma-live.git"
+  },
   "private": true,
   "description": "Browser-to-browser live streaming + chat, in the spirit of Owncast",
   "main": "server.js",
@@ -8,7 +13,8 @@
     "start": "node server.js",
     "test": "node scripts/test-api.js",
     "test:studio": "node scripts/test-studio-key.js",
-    "test:e2e": "node scripts/test-e2e.js"
+    "test:e2e": "node scripts/test-e2e.js",
+    "test:relay": "node scripts/test-relay.js"
   },
   "engines": {
     "node": ">=18"
