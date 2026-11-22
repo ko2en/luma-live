@@ -6,8 +6,6 @@ LICENSE
 *.md
 start.bat
 start.sh
-docker-compose.yml
-render.yaml
 .wbapp_*.genie
 .workbuddy
 node_modules
