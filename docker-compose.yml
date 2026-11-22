@@ -1,0 +1,10 @@
+services:
+  luma-live:
+    build: .
+    image: luma-live:latest
+    container_name: luma-live
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+    restart: unless-stopped

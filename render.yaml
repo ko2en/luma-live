@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: luma-live
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /
+    autoDeploy: true

@@ -17,9 +17,45 @@
 
 <br>
 
-[工作原理](#工作原理) · [安装与部署](#安装与部署) · [已知限制](#已知限制)
+[30 秒上手](#30-秒上手) · [工作原理](#工作原理) · [安装与部署](#安装与部署) · [已知限制](#已知限制)
 
 </div>
+
+## 30 秒上手
+
+三种方式，挑一种。**观众不需要做任何事**——你把地址发给他就行。
+
+### ① Windows：双击就开播
+
+1. 点仓库右上角绿色 **Code → Download ZIP**
+2. 解压到 `C:\luma-live`（不要在压缩包里直接双击）
+3. 双击 **`start.bat`**
+
+脚本会自动检查 Node.js——没装就帮你打开下载页，装好了就启动服务并自动打开开播台。仓库已经带了这个文件，不用写任何命令。
+
+### ② macOS / Linux / Docker：一条命令
+
+```bash
+# 原生运行（需要 Node 18+）
+git clone https://github.com/ko2en/luma-live.git && cd luma-live && ./start.sh
+
+# 或者 Docker（连 Node 都不用装）
+git clone https://github.com/ko2en/luma-live.git && cd luma-live && docker compose up -d
+```
+
+Windows 上装了 Docker 也一样适用，`docker compose up -d` 然后访问 `http://localhost:3000`。
+
+### ③ 云端一键部署：点一下就有公网地址
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/ko2en/luma-live)
+
+点上面的按钮，用 GitHub 账号登录，确认后几分钟内给你一个 `https://xxx.onrender.com` 地址。**HTTPS 自动配好**，所以开播端点开就能用摄像头，不用自己折腾证书。免费额度足够个人直播（闲置一段时间实例会休眠，访问一下会自动唤醒）。
+
+其他支持 Node 的平台（Railway / Koyeb / Zeabur / Fly.io）同理：仓库根目录有 `Dockerfile` 和 `render.yaml`，构建命令留空、启动命令填 `node server.js` 即可。
+
+> 无论是哪种方式，开播都要用 `http://localhost:3000/studio`（或平台给的 https 地址）。用 `IP:3000` 打开会拿不到摄像头——这是浏览器强制的安全策略，详见[安装与部署](#安装与部署)。
+
+## 界面
 
 ![开播控制台](docs/studio.png)
 
@@ -35,6 +71,22 @@
      │  信令 / 状态 / 聊天（KB 级，走服务器）          │
      └──────────────▶  server.js  ──────────────────┘
 ```
+
+## 它适合你吗
+
+先把丑话说在前面，省得你装完才发现不对：
+
+| 你的场景 | 合不合适 |
+|---|---|
+| 和同事、朋友开个小直播，10 人以内 | ✅ **最合适**，一个文件夹搞定 |
+| 想零成本、当天就能用 | ✅ 零依赖、零配置、零费用 |
+| 内网 / 离线环境直播（没有公网） | ✅ 纯 P2P，只要两边网络能通 |
+| 需要一个「低延迟监看」画面（导播、远程看片场） | ✅ 延迟通常 1 秒内 |
+| 想替代 Zoom / 腾讯会议开会 | ⚠️ 没有多人宫格、没有会控、没有录制 |
+| 要几百上千人同时看 | ❌ 换 SFU（mediasoup / LiveKit） |
+| 要录播回看、要手机原生播放器能看 | ❌ 不支持 |
+
+一句话：**它是「房间」，不是「平台」。** 如果你的需求是"点开就能播、发给几个人看、延迟要低、别花钱"，它就是为你做的。
 
 ## 和 Owncast 有什么区别
 
@@ -118,7 +170,7 @@ screenSource → screenGain ┘
 
 ### 装到哪里
 
-其实没有「安装」这一步——就是一个文件夹里的 6 个文件。不写注册表、不装驱动、不注册系统服务、不连数据库。删掉文件夹就等于卸载干净。
+其实没有「安装」这一步——就是一个文件夹里的文件。不写注册表、不装驱动、不注册系统服务、不连数据库。删掉文件夹就等于卸载干净。
 
 | 系统 | 建议位置 | 不要放 |
 |---|---|---|
@@ -127,11 +179,13 @@ screenSource → screenGain ┘
 
 唯一的前置依赖是 **Node.js ≥ 18**。
 
+> 想省事的话，这一节可以整段跳过：Windows 直接双击仓库里的 **`start.bat`**，macOS / Linux 执行 **`./start.sh`**，脚本会自己检查 Node、启动服务、打开浏览器。下面写的是想自己控制每一个步骤（或者要部署到服务器）时的做法。
+
 ### 方案 A：装在自己的 Windows 电脑上
 
 1. **装 Node.js** —— 到 [nodejs.org](https://nodejs.org) 下载 LTS 的 `.msi`，一路下一步。装完打开 PowerShell 验证：`node -v`（应显示 v18 以上）
 2. **放代码** —— 新建 `C:\luma-live`，把代码放进去：装了 git 就 `git clone https://github.com/ko2en/luma-live.git C:\luma-live`，没装就点仓库右上角 **Code → Download ZIP**，解压到 `C:\luma-live`
-3. **启动** —— 在 `C:\luma-live` 目录里执行：
+3. **启动** —— 双击 `C:\luma-live\start.bat`（它会自己开浏览器），或者在 PowerShell 里手动执行：
 
 ```powershell
 cd C:\luma-live

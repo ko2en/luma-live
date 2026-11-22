@@ -1,0 +1,14 @@
+.git
+.gitignore
+docs
+README.md
+LICENSE
+*.md
+start.bat
+start.sh
+docker-compose.yml
+render.yaml
+.wbapp_*.genie
+.workbuddy
+node_modules
+npm-debug.log
