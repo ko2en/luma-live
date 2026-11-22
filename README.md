@@ -125,9 +125,17 @@ flowchart LR
 | `TRUST_PROXY` | 未设 | 设 `1` 时读取 `X-Forwarded-For` 最后一项作为来源 IP |
 | `TURN_HOST` / `TURN_PORT` / `TURN_TLS_PORT` | 未设 / `3478` / `5349` | 可选 TURN 中继；不设则只用 STUN |
 | `TURN_STATIC_AUTH_SECRET` | 空 | TURN 静态密钥，服务端据此现签 6 小时临时凭证 |
-| `TURN_EXTRA` | 空 | 附加 TURN 节点，`host:port:secret` 逗号分隔，各自独立签凭证 |
+| `TURN_EXTRA` | 空 | 附加 TURN 节点，`host:port:secret[:显示名]` 逗号分隔，各自独立签凭证 |
+| `TURN_PREFER` | 空 | 首选节点，填 host / `main` / `extra` / 显示名；排到 `iceServers` 最前，其余节点仍兜底 |
+| `TURN_LABEL` | `main` | 主节点在状态栏里的显示名 |
 
 **只有部署在可信反向代理后面才启用 `TRUST_PROXY=1`**：服务端信任头中最后一个地址，须阻止客户端绕过代理直连，否则来源 IP 可被伪造。
+
+### 多节点时走哪条
+
+浏览器给所有 relay 候选的 ICE 优先级是一样的，实际是「谁的分配先完成、谁先连通就用谁」。服务端把 `TURN_PREFER` 指定的节点排在 `iceServers` 最前面，它就能先开始收集，近端节点通常胜出；首选节点拒绝分配（中继端口用尽、网络不通）时，同一份 `iceServers` 里的其它节点继续兜底，不需要重连。
+
+主播状态栏会显示每一路走的是哪个节点，例如 `TURN 1路（sh 1）`；观众页的连接标签显示为 `TURN中继·sh`。
 
 ## 验证与限制
 

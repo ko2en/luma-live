@@ -9,7 +9,8 @@
     iceServers: [
       { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
       { urls: 'stun:global.stun.twilio.com:3478' }
-    ]
+    ],
+    nodes: []   /* 服务端下发的节点清单，只用来标注这一路走的是哪条中继 */
   };
 
   function applyIce(cfg) {
@@ -17,6 +18,14 @@
     const list = Array.isArray(cfg) ? cfg : cfg.iceServers;
     if (!Array.isArray(list) || !list.length) return;
     ICE.iceServers = list;
+    ICE.nodes = !Array.isArray(cfg) && Array.isArray(cfg.nodes) ? cfg.nodes : [];
+  }
+
+  /* 中继 IP → 节点显示名 */
+  function relayLabel(addr) {
+    if (!addr) return '';
+    const hit = (ICE.nodes || []).find((n) => n && n.host === addr);
+    return hit ? (hit.label || hit.host) : addr;
   }
 
   const el = {
@@ -933,11 +942,20 @@
 
   function paintConnections() {
     const counts = { direct: 0, relay: 0, unknown: 0 };
+    const relayNodes = new Map();   // 中继节点显示名 → 路数
     if (live) for (const pc of peers.values()) {
       if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) continue;
-      counts[pc.connectionState === 'connected' ? (pc.__connectionType || 'unknown') : 'unknown'] += 1;
+      const type = pc.connectionState === 'connected' ? (pc.__connectionType || 'unknown') : 'unknown';
+      counts[type] += 1;
+      if (type === 'relay' && pc.__relayNode) {
+        relayNodes.set(pc.__relayNode, (relayNodes.get(pc.__relayNode) || 0) + 1);
+      }
     }
-    const text = `P2P ${counts.direct}路 / TURN ${counts.relay}路 / 检测中${counts.unknown}路`;
+    let relayPart = `TURN ${counts.relay}路`;
+    if (relayNodes.size) {
+      relayPart += `（${[...relayNodes].map(([k, v]) => `${k} ${v}`).join(' / ')}）`;
+    }
+    const text = `P2P ${counts.direct}路 / ${relayPart} / 检测中${counts.unknown}路`;
     if (el.stConnections.textContent !== text) el.stConnections.textContent = text;
   }
 
@@ -1027,6 +1045,8 @@
     pc.__connectionType = stats && ['direct', 'relay', 'unknown'].includes(stats.connectionType)
       ? stats.connectionType : stats && stats.relay === true ? 'relay' : 'unknown';
     pc.__relay = pc.__connectionType === 'relay' || Boolean(stats && stats.relay);
+    /* 观众会把中继候选的地址带上来，换成节点名显示，方便确认走的是哪条线路 */
+    pc.__relayNode = pc.__relay && stats.relayAddr ? relayLabel(stats.relayAddr) : '';
     paintConnections();
 
     const want = tierFor(stats);
@@ -1174,6 +1194,7 @@
     const pc = new RTCPeerConnection(ICE);
     pc.__tier = 'high';
     pc.__relay = false;
+    pc.__relayNode = '';
     pc.__connectionType = 'unknown';
     pc.__lastStatsAt = Date.now();
     peers.set(viewerId, pc);
@@ -1195,6 +1216,7 @@
       if (s !== 'connected') {
         pc.__connectionType = 'unknown';
         pc.__relay = false;
+        pc.__relayNode = '';
       }
       paintConnections();
       if (s === 'connected') tunePeer(pc);

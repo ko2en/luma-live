@@ -45,18 +45,30 @@ const TURN_STATIC_AUTH_SECRET = String(process.env.TURN_STATIC_AUTH_SECRET || ''
 const TURN_TTL_SEC = 6 * 60 * 60;
 const TURN_USER = 'luma';
 
-/* 附加 TURN 节点（多线路择优）：TURN_EXTRA="host:port:secret,host:port:secret"
-   浏览器会同时收集所有 relay 候选，谁先连通就用谁 —— 近的那条自然胜出。
+/* 附加 TURN 节点（多线路择优）：TURN_EXTRA="host:port:secret[:label],host:port:secret[:label]"
+   label 只是给人看的状态栏名字，取不到就用 host 本身。
    注意：这些节点必须公网可达，且 relay 端口要和映射一一对应，否则候选是死的。 */
 const TURN_EXTRA = String(process.env.TURN_EXTRA || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean)
   .map((s) => {
-    const [host, port, secret] = s.split(':');
-    return { host: (host || '').trim(), port: (port || '3478').trim(), secret: (secret || '').trim() };
+    const [host, port, secret, label] = s.split(':');
+    return {
+      host: (host || '').trim(),
+      port: (port || '3478').trim(),
+      secret: (secret || '').trim(),
+      label: (label || '').trim()
+    };
   })
   .filter((t) => t.host);
+
+/* 首选节点：TURN_PREFER 填节点 host（如 1.2.3.4）或 kind（main / extra）或显示名。
+   浏览器给 relay 候选的 ICE 优先级是一样的，基本上「谁先分配成功、先连通就用谁」；
+   把首选节点排在 iceServers 最前面能让它先开始收集，真实测下来近端节点几乎总胜出。
+   首选节点拒绝分配（端口用尽、网络不通）时，同一份 iceServers 里的其它节点仍然兜底。 */
+const TURN_PREFER = String(process.env.TURN_PREFER || '').trim();
+const TURN_LABEL = String(process.env.TURN_LABEL || '').trim();
 
 /* 默认 STUN：不配 TURN 时就是这一份，行为和以前完全一致 */
 const DEFAULT_STUN = [
@@ -241,20 +253,45 @@ function turnEntry(host, port, secret, tlsPort) {
 
 function iceNodes() {
   const nodes = [];
-  if (TURN_HOST) nodes.push({ host: TURN_HOST, port: TURN_PORT, secret: TURN_STATIC_AUTH_SECRET, tls: TURN_TLS_PORT });
-  for (const t of TURN_EXTRA) nodes.push({ host: t.host, port: t.port, secret: t.secret, tls: '0' });
+  if (TURN_HOST) {
+    nodes.push({
+      host: TURN_HOST, port: TURN_PORT, secret: TURN_STATIC_AUTH_SECRET,
+      tls: TURN_TLS_PORT, kind: 'main', label: TURN_LABEL || 'main'
+    });
+  }
+  for (const t of TURN_EXTRA) {
+    nodes.push({ host: t.host, port: t.port, secret: t.secret, tls: '0', kind: 'extra', label: t.label || t.host });
+  }
+
+  /* 首选节点挪到最前；找不到就保持原顺序，不报错也不影响兜底 */
+  if (TURN_PREFER && nodes.length > 1) {
+    const want = TURN_PREFER.toLowerCase();
+    const idx = nodes.findIndex((n) =>
+      n.host.toLowerCase() === want || n.kind === want || n.label.toLowerCase() === want);
+    if (idx > 0) {
+      const [pick] = nodes.splice(idx, 1);
+      nodes.unshift(pick);
+    }
+  }
   return nodes;
 }
 
 function icePayload() {
+  const nodes = iceNodes();
   const servers = [{ urls: DEFAULT_STUN.slice() }];
 
-  for (const node of iceNodes()) {
+  for (const node of nodes) {
     servers.push({ urls: [`stun:${node.host}:${node.port}`] });
     servers.push(turnEntry(node.host, node.port, node.secret, node.tls));
   }
 
-  return { iceServers: servers, ttl: TURN_TTL_SEC };
+  return {
+    iceServers: servers,
+    ttl: TURN_TTL_SEC,
+    /* nodes / preferred 只用于前端显示「这一路走的是哪个节点」，不参与协商 */
+    nodes: nodes.map((n) => ({ host: n.host, port: n.port, label: n.label, kind: n.kind })),
+    preferred: nodes.length ? nodes[0].host : ''
+  };
 }
 
 function clearHostGrace() {
@@ -849,7 +886,17 @@ server.listen(PORT, '0.0.0.0', () => {
   /* 附加节点单独列出，方便一眼看出多线路是否都吃到了 */
   for (const t of TURN_EXTRA) {
     const mark = t.secret ? 'REST 凭证' : '匿名中继';
-    console.log(`  TURN 附加 ${t.host}:${t.port} · udp/tcp · ${mark}`);
+    console.log(`  TURN 附加 ${t.host}:${t.port} · udp/tcp · ${mark}${t.label ? ` · ${t.label}` : ''}`);
+  }
+  const turnOrder = iceNodes();
+  if (turnOrder.length > 1) {
+    const names = turnOrder.map((n) => `${n.label}(${n.host})`).join(' → ');
+    console.log(`  中继顺序  ${names}`);
+    if (TURN_PREFER) {
+      console.log(`            首选 ${turnOrder[0].label} —— 排在 iceServers 最前，先完成分配的先被选中`);
+    } else {
+      console.log('            想让某个节点优先，设 TURN_PREFER=<host|main|extra|label>');
+    }
   }
   if (AUTH_LOCK_MS) console.log(`  口令限速 ${AUTH_MAX_FAILS} 次失败锁 ${AUTH_LOCK_MS / 1000}s${TRUST_PROXY ? '（读 X-Forwarded-For）' : ''}`);
 });

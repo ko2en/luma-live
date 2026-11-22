@@ -370,6 +370,7 @@ async function testTurn() {
 
     // ---- 9. TURN 下发（另起一台带 TURN_* 的服务） ----
     await testTurn();
+    await testTurnPrefer();
 
     // ---- 10. 口令尝试限速（放最后：会把自己锁住） ----
     await req('POST', '/api/auth', { key: KEY }); // 先清零计数
@@ -416,3 +417,83 @@ async function testTurn() {
     }
   }
 })();
+
+/* ------------------------------------------------------------------ *
+ * TURN 优先节点：TURN_PREFER 决定 iceServers 里哪个节点排在最前
+ * ------------------------------------------------------------------ */
+async function iceOrder(env, port) {
+  const srv = spawnServer(Object.assign({
+    PORT: String(port),
+    STREAM_KEY: '',
+    HOST_GRACE_MS: '0',
+    TURN_TLS_PORT: '0'
+  }, env), port);
+  let ice = null;
+  let boot = '';
+  try {
+    if (!await srv.ready()) return { ice, boot: srv.boot() };
+    boot = srv.boot();
+    const viewer = await sse('role=viewer&id=probe&name=probe', port);
+    const welcome = await viewer.waitFor('welcome');
+    ice = welcome && welcome.data && welcome.data.ice;
+    viewer.close();
+  } finally {
+    srv.child.kill();
+    await sleep(150);
+  }
+  return { ice, boot };
+}
+
+/* 取第一条 turn: 的 host */
+function firstTurnHost(ice) {
+  const list = (ice && ice.iceServers) || [];
+  for (const s of list) {
+    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+    for (const u of urls) {
+      const m = /^turns?:([^:?]+)/.exec(String(u) || '');
+      if (m) return m[1];
+    }
+  }
+  return '';
+}
+
+async function testTurnPrefer() {
+  const extra = '203.0.113.20:23478:sh-secret:sh';
+
+  /* 1. 显式指定优先节点 */
+  const a = await iceOrder({
+    TURN_HOST: 'hk.example.com',
+    TURN_PORT: '3478',
+    TURN_STATIC_AUTH_SECRET: 'main-secret',
+    TURN_EXTRA: extra,
+    TURN_PREFER: '203.0.113.20'
+  }, PORT + 11);
+  check('优先节点服务启动', !!(a.ice && a.ice.iceServers), (a.boot || '').slice(0, 160));
+  check('TURN_PREFER=上海 → 上海排在最前', firstTurnHost(a.ice) === '203.0.113.20', firstTurnHost(a.ice));
+  check('香港节点仍在（兜底）', JSON.stringify(a.ice || {}).includes('turn:hk.example.com'));
+  check('nodes 里带显示名', !!(a.ice && a.ice.nodes && a.ice.nodes[0] && a.ice.nodes[0].label === 'sh'),
+    JSON.stringify((a.ice && a.ice.nodes) || []));
+  check('preferred 与首个节点一致', !!(a.ice && a.ice.preferred === '203.0.113.20'), String(a.ice && a.ice.preferred));
+  check('附加节点各签各的凭证',
+    !!((a.ice && a.ice.iceServers) || []).filter((s) => String(s.urls).includes('turn:203.0.113.20')).every((s) => s.credential));
+  check('启动日志打印中继顺序', (a.boot || '').includes('中继顺序'), (a.boot || '').slice(-200));
+
+  /* 2. 不设 TURN_PREFER → 保持 TURN_HOST 在前，行为与旧版一致 */
+  const b = await iceOrder({
+    TURN_HOST: 'hk.example.com',
+    TURN_PORT: '3478',
+    TURN_STATIC_AUTH_SECRET: 'main-secret',
+    TURN_EXTRA: extra
+  }, PORT + 12);
+  check('不设 TURN_PREFER → 主节点仍在前', firstTurnHost(b.ice) === 'hk.example.com', firstTurnHost(b.ice));
+
+  /* 3. TURN_PREFER 可以写 kind */
+  const c = await iceOrder({
+    TURN_HOST: 'hk.example.com',
+    TURN_PORT: '3478',
+    TURN_STATIC_AUTH_SECRET: 'main-secret',
+    TURN_EXTRA: extra,
+    TURN_PREFER: 'extra'
+  }, PORT + 13);
+  check('TURN_PREFER=extra 也能生效', firstTurnHost(c.ice) === '203.0.113.20', firstTurnHost(c.ice));
+}

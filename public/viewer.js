@@ -10,7 +10,8 @@
     iceServers: [
       { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
       { urls: 'stun:global.stun.twilio.com:3478' }
-    ]
+    ],
+    nodes: []   /* 服务端下发的节点清单，只用来标注这一路走的是哪条中继 */
   };
 
   function applyIce(cfg) {
@@ -18,6 +19,7 @@
     const list = Array.isArray(cfg) ? cfg : cfg.iceServers;
     if (!Array.isArray(list) || !list.length) return;
     ICE.iceServers = list;
+    ICE.nodes = !Array.isArray(cfg) && Array.isArray(cfg.nodes) ? cfg.nodes : [];
   }
 
   const el = {
@@ -165,7 +167,7 @@
     }
   }
 
-  function paintConnection(type) {
+  function paintConnection(type, nodeLabel) {
     const labels = {
       idle: ['未连接', '媒体尚未连接，是否使用 TURN 中继尚未确定。'],
       connecting: ['连接中', '正在建立媒体连接，是否使用 TURN 中继尚未确定。'],
@@ -174,7 +176,11 @@
       relay: ['TURN中继', '媒体经过 TURN 服务器中继，任一端使用中继即计为 TURN。'],
       reconnecting: ['断开重连中', '媒体连接已断开，正在恢复；旧路径状态已清除。']
     };
-    const [text, title] = labels[type];
+    let [text, title] = labels[type];
+    if (type === 'relay' && nodeLabel) {
+      text = `TURN中继·${nodeLabel}`;
+      title = `媒体经过 TURN 中继（${nodeLabel}）。`;
+    }
     if (el.connection.textContent !== text) el.connection.textContent = text;
     el.connection.title = title;
     el.connection.dataset.connectionType = type;
@@ -611,14 +617,28 @@
       else if (!selected.length && nominated.length === 1) pair = nominated[0];
     }
     if (!pair || pair.type !== 'candidate-pair' || (pair.state && pair.state !== 'succeeded')) {
-      return { connectionType: 'unknown', rtt: 0 };
+      return { connectionType: 'unknown', rtt: 0, relayAddr: '' };
     }
     const local = byId.get(pair.localCandidateId);
     const remote = byId.get(pair.remoteCandidateId);
     const types = [local && local.candidateType, remote && remote.candidateType];
     const connectionType = types.includes('relay') ? 'relay'
       : types.every((type) => ['host', 'srflx', 'prflx'].includes(type)) ? 'direct' : 'unknown';
-    return { connectionType, rtt: typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime : 0 };
+    /* 中继候选的 address 就是 TURN 给的那段地址，等于节点本身的公网 IP；
+       带回去让主播端能标出「这一路走的是哪条中继」 */
+    const relaySide = [local, remote].find((c) => c && c.candidateType === 'relay');
+    return {
+      connectionType,
+      rtt: typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime : 0,
+      relayAddr: relaySide ? String(relaySide.address || relaySide.ip || '') : ''
+    };
+  }
+
+  /* 把中继 IP 换成人看得懂的名字，取不到就退回 IP */
+  function relayLabel(addr) {
+    if (!addr) return '';
+    const hit = (ICE.nodes || []).find((n) => n && n.host === addr);
+    return hit ? (hit.label || hit.host) : addr;
   }
 
   async function sampleLink() {
@@ -632,10 +652,11 @@
     let lost = 0;
     let rtt = 0;
     let connectionType = 'unknown';
+    let relayAddr = '';
 
     try {
       const stats = await sampledPeer.getStats();
-      ({ connectionType, rtt } = selectedLink(stats));
+      ({ connectionType, rtt, relayAddr } = selectedLink(stats));
 
       stats.forEach((r) => {
         if (r.type === 'inbound-rtp' && r.kind === 'video' && typeof r.bytesReceived === 'number') {
@@ -650,7 +671,7 @@
 
     // 采样期间可能已重建连接，旧结果不能污染新连接的计数和档位。
     if (pc !== sampledPeer || sampledPeer.connectionState !== 'connected' || !state.live) { sampling = false; return; }
-    paintConnection(connectionType);
+    paintConnection(connectionType, connectionType === 'relay' ? relayLabel(relayAddr) : '');
     const now = performance.now();
     let kbps = 0;
     let loss = 0;
@@ -685,7 +706,9 @@
         rtt: Math.round(rtt * 1000),
         /* relay=true 表示这一路在走 TURN 中继，主播端会据此压低码率省服务器带宽 */
         relay: connectionType === 'relay',
-        connectionType
+        connectionType,
+        /* 走中继时带上节点地址，主播端据此显示「上海 / 香港」 */
+        relayAddr: connectionType === 'relay' ? relayAddr : ''
       }
     });
   }
