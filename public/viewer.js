@@ -379,6 +379,7 @@
   let hostId = null;
   let pendingCandidates = [];
   let restartTimer = null;
+  let connectionAttemptTimer = null;
   let unmuteOffered = false;
   let everConnected = false;
   let failStreak = 0;
@@ -390,6 +391,7 @@
   function closePeer() {
     paintConnection('idle');
     clearTimeout(restartTimer);
+    clearTimeout(connectionAttemptTimer);
     pendingCandidates = [];
     lastInbound = null;
     stalledCount = 0;
@@ -439,15 +441,12 @@
     failStreak += 1;
     const reachable = await probeIce(peer).catch(() => null);
 
-    // 还有可用候选对，或者之前成功过（只是抖动）→ 快速重试
-    if (reachable === true || everConnected || failStreak < 2) {
-      requestRestart();
-      return;
-    }
-
+    /* 线路由观众明确选择，失败不能自动重试/换候选；否则主播会反复重建
+       peer，表现成 P2P/上海来回跳。失败后停在当前线路，等观众手动切换。 */
     hardFail = true;
+    clearTimeout(restartTimer);
+    paintConnection('idle');
     showConnectProblem();
-    requestRestart(20000); // 慢速兜底：换了网络还能自愈
   }
 
   function createPeer() {
@@ -474,6 +473,7 @@
     peer.onconnectionstatechange = () => {
       if (pc !== peer) return;
       const s = peer.connectionState;
+      clearTimeout(connectionAttemptTimer);
       paintConnection(s === 'connected' ? 'unknown'
         : ['disconnected', 'failed'].includes(s) ? 'reconnecting'
         : s === 'closed' ? 'idle' : 'connecting');
@@ -511,6 +511,11 @@
     state.hostId = from;
     closePeer();
     pc = createPeer();
+    connectionAttemptTimer = setTimeout(() => {
+      if (pc && pc.connectionState !== 'connected') {
+        paintConnection('idle');
+      }
+    }, 10000);
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
       while (pendingCandidates.length) {
@@ -522,7 +527,10 @@
       postSignal(from, { sdp: pc.localDescription });
       waiting();
     } catch (err) {
-      requestRestart();
+      hardFail = true;
+      clearTimeout(restartTimer);
+      paintConnection('idle');
+      showConnectProblem();
     }
   }
 
@@ -553,7 +561,9 @@
 
   function writeTurnPref(v) {
     try {
-      if (!v || v === 'p2p') localStorage.removeItem(TURN_KEY);
+      /* p2p 也要存：不存的话刷新/重连时 pref 为空就会退回服务器默认线路（上海），
+         看起来就是「选了 P2P 又自动跳回上海」。 */
+      if (!v) localStorage.removeItem(TURN_KEY);
       else localStorage.setItem(TURN_KEY, v);
     } catch (err) { /* 隐私模式写不进去，当次有效即可 */ }
   }
@@ -586,12 +596,18 @@
     el.turnPick.title = `当前线路：${(lines.find((l) => l.id === want) || {}).title || want}`;
   }
 
-  /* 服务端实际生效的线路若与本地记录不同（线路被删/改名），以服务端为准 */
+  /* 线路只能由观众选择，服务端 welcome 不能把它改成另一条：
+     只有首次访问没有选择时，才接受服务器默认线路。 */
   function syncTurnLine(ice) {
     if (!ice) return;
     const actual = ice.line || 'p2p';
-    turnLine = actual;
-    if (readTurnPref() && readTurnPref() !== actual) writeTurnPref(actual);
+    const chosen = readTurnPref();
+    if (!chosen) {
+      turnLine = actual;
+      writeTurnPref(actual);
+    } else {
+      turnLine = chosen;
+    }
   }
 
   function switchLine(id) {
@@ -606,7 +622,13 @@
   }
 
   function reconnectIce() {
-    try { if (es) es.close(); } catch (err) { /* noop */ }
+    esGen += 1;
+    try {
+      if (es) {
+        es.onerror = null;
+        es.close();
+      }
+    } catch (err) { /* noop */ }
     es = null;
     closePeer();
     hardFail = false;
@@ -621,14 +643,18 @@
   /* ================= 事件流 ================= */
 
   let es = null;
+  /* 每次主动重建 SSE 都递增：旧连接迟到的 welcome/onerror 不能再覆盖新线路 */
+  let esGen = 0;
 
   function connect() {
+    const myGen = esGen;
     const turnQ = turnLine ? `&turn=${encodeURIComponent(turnLine)}` : '';
     es = new EventSource(
       `/api/events?role=viewer&id=${encodeURIComponent(clientId)}&name=${encodeURIComponent(nickname)}${turnQ}`
     );
 
     es.addEventListener('welcome', (e) => {
+      if (myGen !== esGen) return;  /* 旧连接的迟到首包，别把新线路改回去 */
       const data = JSON.parse(e.data);
       applyIce(data.ice);
       syncTurnLine(data.ice);
@@ -683,10 +709,11 @@
     });
 
     es.onerror = () => {
+      if (myGen !== esGen) return;  /* 已被主动重建，别再开一条重复 SSE */
       // EventSource 会自动重连，这里只做提示
       if (es.readyState === EventSource.CLOSED) {
         toast('连接已断开，正在重试…');
-        setTimeout(connect, 2500);
+        setTimeout(() => { if (myGen === esGen) connect(); }, 2500);
       }
     };
   }
@@ -792,8 +819,9 @@
         stalledCount += 1;
         if (stalledCount >= 3) {
           stalledCount = 0;
-          toast('画面卡住了，正在重新连接…');
-          requestRestart(500);
+          toast('当前线路画面无数据，请手动切换线路');
+          hardFail = true;
+          paintConnection('idle');
         }
       } else {
         stalledCount = 0;

@@ -12,7 +12,8 @@
     ],
     iceTransportPolicy: 'all',  /* welcome 收到前先用默认；收到后由服务端决定 */
     lines: [],   /* 服务端下发的可选线路，用来填下拉 */
-    line: 'p2p'  /* 本次实际生效的线路 */
+    line: 'p2p',  /* 本次实际生效的线路 */
+    byLine: {}    /* 每条线路的现签 ICE 配置：主播按观众的选择逐路取用 */
   };
 
   function applyIce(cfg) {
@@ -24,6 +25,7 @@
     /* line / lines 服务端下发：本次生效的线路 + 全部可选线路（主播端只用来标注节点名） */
     ICE.line = !Array.isArray(cfg) && typeof cfg.line === 'string' && cfg.line ? cfg.line : 'p2p';
     ICE.lines = !Array.isArray(cfg) && Array.isArray(cfg.lines) ? cfg.lines : [];
+    if (!Array.isArray(cfg) && cfg.byLine && typeof cfg.byLine === 'object') ICE.byLine = cfg.byLine;
   }
 
   /* 中继 IP → 节点显示名 */
@@ -92,6 +94,7 @@
 
   const hostId = uuid();
   const peers = new Map();
+  const viewerLines = new Map();  /* viewerId → 该观众当前选的线路（主播逐路跟随） */
   let localStream = null;
   let camStream = null;
   let screenStream = null;
@@ -979,6 +982,7 @@
 
   function closeAllPeers() {
     for (const id of Array.from(peers.keys())) closePeer(id);
+    viewerLines.clear();
     lastBytes = null;
     el.stBitrate.textContent = '—';
   }
@@ -1030,7 +1034,8 @@
 
   /* 每个观众一条独立 RTCPeerConnection，天然可以单独设档。
      观众端每 3 秒回报一次丢包/RTT，这里据此调该观众的码率上限。 */
-  const TIER_BITRATE = { high: 2500000, mid: 1200000, low: 600000 };
+  /* 固定发送参数：不按网络分级，所有观众统一 720p/30fps/1200kbps。 */
+  const FIXED_BITRATE = 1200000;
   const TIER_RANK = { low: 0, mid: 1, high: 2 };
 
   function tierFor(stats) {
@@ -1055,28 +1060,8 @@
     pc.__relayNode = pc.__relay && stats.relayAddr ? relayLabel(stats.relayAddr) : '';
     paintConnections();
 
-    const want = tierFor(stats);
-    const cur = pc.__tier || 'high';
-    if (want === cur) {
-      pc.__goodStreak = 0;
-      return;
-    }
-
-    // 掉档立刻生效；升档要连续三次稳定，避免在边界来回抖
-    if (TIER_RANK[want] < TIER_RANK[cur]) {
-      pc.__tier = want;
-      pc.__goodStreak = 0;
-      tunePeer(pc);
-    } else {
-      // 连续稳定必须是同一个目标档位，mid/high 交替不算稳定。
-      pc.__goodStreak = pc.__upgradeTarget === want ? (pc.__goodStreak || 0) + 1 : 1;
-      pc.__upgradeTarget = want;
-      if (pc.__goodStreak >= 3) {
-        pc.__tier = want;
-        pc.__goodStreak = 0;
-        tunePeer(pc);
-      }
-    }
+    /* 固定发送档位：只记录链路状态，不因丢包/RTT 改码率或重建连接。 */
+    return;
   }
 
   const VIDEO_LONG_EDGE = [1280, 960, 640];
@@ -1105,16 +1090,15 @@
   async function tuneSender(pc, sender) {
     const state = videoState(pc, sender.track);
     const settings = sender.track.getSettings ? sender.track.getSettings() : {};
-    const tier = pc.__tier || 'high';
-    const index = Math.min(2, 2 - TIER_RANK[tier] + state.step);
+    const index = 0;
     const longest = Math.max(settings.width || 0, settings.height || 0);
     const params = sender.getParameters();
     if (!params.encodings || !params.encodings.length) params.encodings = [{}];
     params.encodings.forEach((encoding) => {
-      encoding.maxBitrate = TIER_BITRATE[tier];
+      encoding.maxBitrate = FIXED_BITRATE;
       encoding.maxFramerate = VIDEO_TARGET_FPS;
-      // 720p 源对应 720/540/360p，竖屏和高分屏同样按最长边处理，不放大小源。
-      encoding.scaleResolutionDownBy = Math.max(1, longest / VIDEO_LONG_EDGE[index]);
+      /* 固定原始 720p，不根据丢包/RTT/编码压力改变分辨率。 */
+      encoding.scaleResolutionDownBy = Math.max(1, longest / 1280);
     });
     params.degradationPreference = 'maintain-framerate';
     await sender.setParameters(params);
@@ -1133,6 +1117,9 @@
     if (!sender) return;
     const track = sender.track;
     const state = videoState(pc, track);
+    /* 固定码率/分辨率，不做动态降级或升档；保留统计仅供状态展示。 */
+    state.bad = 0;
+    state.good = 0;
     const sources = new Map();
     report.forEach((r) => {
       if (r.type !== 'media-source' || (r.kind || r.mediaType) !== 'video') return;
@@ -1184,23 +1171,26 @@
     state.good = fps >= 29 && !limited ? state.good + 1 : 0;
     if (now - state.switchedAt < VIDEO_SWITCH_COOLDOWN) return;
     const baseline = 2 - TIER_RANK[pc.__tier || 'high'];
-    if (state.bad >= 2 && baseline + state.step < 2) state.step += 1;
-    else if (state.good >= 5 && state.step > 0) state.step -= 1;
-    else return;
-    state.switchedAt = now;
-    state.bad = 0;
-    state.good = 0;
-    tunePeer(pc);
+    return; /* 固定发送档位：不再根据视频统计调整分辨率 */
+  }
+
+  /* 主播不再写死一条线路：每个观众用他自己选的那份 ICE 配置建 peer。
+     这样 p2p 观众不会撞上主播的 relay-only 候选，上海/香港也能各走各的。 */
+  function iceForViewer(viewerId) {
+    const line = viewerLines.get(viewerId) || ICE.line || 'p2p';
+    const cfg = ICE.byLine && ICE.byLine[line];
+    return {
+      iceServers: cfg && Array.isArray(cfg.iceServers) && cfg.iceServers.length
+        ? cfg.iceServers : ICE.iceServers,
+      iceTransportPolicy: cfg && cfg.iceTransportPolicy ? cfg.iceTransportPolicy : ICE.iceTransportPolicy
+    };
   }
 
   async function connectViewer(viewerId) {
     if (!localStream || !live) return;
     closePeer(viewerId);
 
-    const pc = new RTCPeerConnection({
-      iceServers: ICE.iceServers,
-      iceTransportPolicy: ICE.iceTransportPolicy
-    });
+    const pc = new RTCPeerConnection(iceForViewer(viewerId));
     pc.__tier = 'high';
     pc.__relay = false;
     pc.__relayNode = '';
@@ -1320,18 +1310,39 @@
     es.addEventListener('go-live', (e) => {
       let data = {};
       try { data = JSON.parse(e.data); } catch (err) { /* noop */ }
-      const viewers = Array.isArray(data.viewers) ? data.viewers : Array.from(peers.keys());
-      viewers.forEach((vid) => connectViewer(vid));
+      const viewers = Array.isArray(data.viewers)
+        ? data.viewers
+        : Array.from(peers.keys()).map((id) => ({ id, line: viewerLines.get(id) || ICE.line }));
+      viewers.forEach((v) => {
+        const vid = typeof v === 'string' ? v : v && v.id;
+        if (!vid) return;
+        if (v && v.line) viewerLines.set(vid, v.line);
+        connectViewer(vid);
+      });
     });
 
     es.addEventListener('viewer-joined', (e) => {
-      const { id } = JSON.parse(e.data) || {};
-      if (id) connectViewer(id);
+      const { id, line } = JSON.parse(e.data) || {};
+      if (id) {
+        if (line) viewerLines.set(id, line);
+        connectViewer(id);
+      }
     });
 
     es.addEventListener('viewer-left', (e) => {
       const { id } = JSON.parse(e.data) || {};
-      if (id) closePeer(id);
+      if (id) {
+        viewerLines.delete(id);
+        closePeer(id);
+      }
+    });
+
+    es.addEventListener('viewer-line', (e) => {
+      const { id, line } = JSON.parse(e.data) || {};
+      if (!id || !line) return;
+      viewerLines.set(id, line);
+      /* ICE 只在 new RTCPeerConnection 时读取，换线路必须重建这一路 */
+      if (peers.has(id)) connectViewer(id);
     });
 
     es.addEventListener('stream-ended', () => {

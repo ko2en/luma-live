@@ -355,9 +355,12 @@ function viewerCount() {
   return n;
 }
 
-function viewerIds() {
+/* 主播要给每个观众单独建 peer，所以除了 id 还要带它当前选的线路。 */
+function viewerDescriptors() {
   const out = [];
-  for (const c of clients.values()) if (c.role === 'viewer') out.push(c.id);
+  for (const c of clients.values()) {
+    if (c.role === 'viewer') out.push({ id: c.id, line: c.line || 'p2p' });
+  }
   return out;
 }
 
@@ -501,9 +504,12 @@ function handleEvents(req, res, url) {
   /* 线路：页面上的下拉选中后会带 turn=<线路 id> 重连（p2p 表示不要 TURN）。
      不传就用服务器默认线路。 */
   const turn = (url.searchParams.get('turn') || '').slice(0, 32);
+  const chosenLine = pickLine(turn);
+  const lineId = role === 'viewer' ? (chosenLine ? chosenLine.id : 'p2p') : '';
 
   if (!id) return json(res, 400, { error: 'missing id' });
   const previous = clients.get(id);
+  const oldLine = previous && previous.role === 'viewer' ? (previous.line || 'p2p') : '';
   if (previous && (previous.session !== req.session || previous.role !== role)) {
     return json(res, 409, { error: 'id already in use' });
   }
@@ -547,7 +553,13 @@ function handleEvents(req, res, url) {
     clients.delete(id);
   }
 
-  clients.set(id, { id, role, session: req.session, res, name, joinedAt: Date.now() });
+  clients.set(id, { id, role, session: req.session, res, name, joinedAt: Date.now(), line: lineId });
+
+  /* 观众切换线路会带新 turn= 重连：告诉主播重建这一路 peer，
+     否则主播还用旧线路的 ICE 配置，两端候选集对不上就黑屏。 */
+  if (oldLine && oldLine !== lineId && stream.hostId) {
+    sendTo(stream.hostId, 'viewer-line', { id, line: lineId });
+  }
 
   if (role === 'host') {
     /* 换了一台设备/换了标签页开播：让旧的那个安静退场。
@@ -572,11 +584,18 @@ function handleEvents(req, res, url) {
      EventSource 断线重连会让 welcome 再来一遍，不能只在第一次生效。
      TODO(安全)：EventSource 不支持自定义 POST，host 的口令只能留在 query 里，
      会进反向代理的访问日志。等改为「/api/auth 换短期 token → SSE 带 token」后去掉。 */
-  sendTo(id, 'welcome', { id, role, ice: icePayload(turn, role), ...statePayload() });
+  const ice = icePayload(turn, role);
+  /* 主播不再固定一条线：把每条线路现签的 ICE 配置都给他，
+     他按每个观众当前选的线路建 peer（p2p = 纯 STUN，sh/hk = 对应 TURN 强制 relay）。 */
+  if (role === 'host' && TURN_LINES.length) {
+    ice.byLine = { p2p: icePayload('p2p', 'viewer') };
+    for (const l of TURN_LINES) ice.byLine[l.id] = icePayload(l.id, 'viewer');
+  }
+  sendTo(id, 'welcome', { id, role, ice, ...statePayload() });
   sendTo(id, 'history', chatLog.slice(-80));
   if (role === 'viewer') {
     if (stream.live && stream.hostId && stream.hostId !== id) {
-      sendTo(stream.hostId, 'viewer-joined', { id, name });
+      sendTo(stream.hostId, 'viewer-joined', { id, name, line: lineId });
     }
   }
   /* 主播重连（刷新页面、换设备、长连接被中间设备掐断后自愈）时，
@@ -584,7 +603,7 @@ function handleEvents(req, res, url) {
      表现就是「直播中」但观众一直黑屏。这里补一次 go-live，主播端会
      按 viewers 列表重建全部连接。 */
   if (role === 'host' && stream.live) {
-    sendTo(id, 'go-live', { viewers: viewerIds() });
+    sendTo(id, 'go-live', { viewers: viewerDescriptors() });
   }
 
   broadcastState();
@@ -830,7 +849,7 @@ async function handleApi(req, res, url) {
       broadcastState();
       broadcast('go-live');
       // 让开播端知道要给哪些观众发 offer
-      sendTo(stream.hostId, 'go-live', { viewers: viewerIds() });
+      sendTo(stream.hostId, 'go-live', { viewers: viewerDescriptors() });
       return json(res, 200, statePayload());
     }
 

@@ -370,6 +370,7 @@ async function testTurn() {
     // ---- 9. TURN 下发（另起一台带 TURN_* 的服务） ----
     await testTurn();
     await testLines();
+    await testDynamicHostLines();
 
     // ---- 10. 口令尝试限速（放最后：会把自己锁住） ----
     await req('POST', '/api/auth', { key: KEY }); // 先清零计数
@@ -520,9 +521,67 @@ async function testLines() {
     JSON.stringify(h.ice || {}).includes('203.0.113.20') && !turnHosts(h.ice).length,
     JSON.stringify(h.ice || {}).slice(0, 200));
 
-  /* 8. 主播端忽略 turn 参数：不管传什么，都固定用默认线路 */
+  /* 8. 主播端按观众线路动态取用：ice 本身保留默认线路做兼容，byLine 带全部线路 */
   const i = await iceOrder(env, PORT + 19, 'hk', 'host');
-  check('主播端固定默认线路（不受 turn=hk 影响）',
+  check('主播端 welcome 的 ice 仍保留默认线路（兼容旧前端）',
     !!(i.ice && i.ice.line === 'sh') && turnHosts(i.ice).join(',') === '203.0.113.20',
     JSON.stringify({ line: i.ice && i.ice.line, hosts: turnHosts(i.ice) }));
+  check('主播端收到每条线路的 ICE 配置',
+    !!(i.ice && i.ice.byLine && i.ice.byLine.p2p && i.ice.byLine.sh && i.ice.byLine.hk),
+    Object.keys((i.ice && i.ice.byLine) || {}).join(','));
+  check('主播逐线路策略：p2p=all，sh/hk=relay',
+    !!(i.ice.byLine.p2p.iceTransportPolicy === 'all'
+      && i.ice.byLine.sh.iceTransportPolicy === 'relay'
+      && i.ice.byLine.hk.iceTransportPolicy === 'relay'));
+  check('主播逐线路只带各自的 TURN',
+    turnHosts(i.ice.byLine.sh).join(',') === '203.0.113.20'
+    && turnHosts(i.ice.byLine.hk).join(',') === 'hk.example.com'
+    && turnHosts(i.ice.byLine.p2p).length === 0,
+    `${turnHosts(i.ice.byLine.sh)} / ${turnHosts(i.ice.byLine.hk)} / ${turnHosts(i.ice.byLine.p2p)}`);
+}
+
+/* 观众换线路时，服务端要告诉主播换哪一路 peer 的 ICE 配置 */
+async function testDynamicHostLines() {
+  const port = PORT + 20;
+  const srv = spawnServer({
+    PORT: String(port),
+    STREAM_KEY: '',
+    HOST_GRACE_MS: '0',
+    TURN_LINES: 'sh|203.0.113.20|23478|sh-secret|上海',
+    TURN_DEFAULT: 'sh'
+  }, port);
+  let host = null;
+  let v1 = null;
+  let v2 = null;
+  try {
+    if (!await srv.ready()) return check('动态线路测试服务启动', false, srv.boot().slice(-200));
+    host = await sse('role=host&id=dh&name=H', port);
+    await host.waitFor('welcome');
+    const live = await req('POST', '/api/stream', { id: 'dh', live: true }, null, port);
+    check('动态线路测试：开播成功', live.status === 200 && live.body.live === true);
+
+    v1 = await sse('role=viewer&id=dv1&name=V&turn=sh', port);
+    await v1.waitFor('welcome');
+    const joined = await host.waitFor('viewer-joined');
+    check('viewer-joined 带上观众当前线路', !!(joined && joined.data.line === 'sh'),
+      joined ? JSON.stringify(joined.data) : 'no event');
+
+    v2 = await sse('role=viewer&id=dv1&name=V&turn=p2p', port);
+    await v2.waitFor('welcome');
+    const switched = await host.waitFor('viewer-line');
+    check('观众切线路 → 主播收到 viewer-line', !!(switched && switched.data.id === 'dv1' && switched.data.line === 'p2p'),
+      switched ? JSON.stringify(switched.data) : 'no event');
+
+    await req('POST', '/api/stream', { id: 'dh', live: true }, null, port);
+    await sleep(150);
+    const goEvt = host.events.filter((e) => e.event === 'go-live').pop();
+    check('go-live 的观众列表带线路信息',
+      !!(goEvt && Array.isArray(goEvt.data.viewers)
+        && goEvt.data.viewers.some((v) => v.id === 'dv1' && v.line === 'p2p')),
+      goEvt ? JSON.stringify(goEvt.data.viewers) : 'no event');
+  } finally {
+    for (const c of [host, v1, v2]) { try { if (c) c.close(); } catch (err) { /* noop */ } }
+    srv.child.kill();
+    await sleep(150);
+  }
 }
