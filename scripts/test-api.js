@@ -421,7 +421,7 @@ async function testTurn() {
  * 线路：TURN_LINES 定义可选线路，p2p 永远可选，turn= 决定本次下发哪条
  * ------------------------------------------------------------------ */
 /* 起一台临时服务，取 welcome 里下发的 ice；turn 是本次要选的线路 */
-async function iceOrder(env, port, turn) {
+async function iceOrder(env, port, turn, role) {
   const srv = spawnServer(Object.assign({
     PORT: String(port),
     STREAM_KEY: '',
@@ -433,7 +433,7 @@ async function iceOrder(env, port, turn) {
     if (!await srv.ready()) return { ice, boot: srv.boot() };
     boot = srv.boot();
     const turnQ = turn ? `&turn=${encodeURIComponent(turn)}` : '';
-    const viewer = await sse(`role=viewer&id=probe&name=probe${turnQ}`, port);
+    const viewer = await sse(`role=${role || 'viewer'}&id=probe&name=probe${turnQ}`, port);
     const welcome = await viewer.waitFor('welcome');
     ice = welcome && welcome.data && welcome.data.ice;
     viewer.close();
@@ -508,4 +508,21 @@ async function testLines() {
   const f = await iceOrder({}, PORT + 16);
   check('未配 TURN → 线路只有 P2P', lineIds(f.ice).join(',') === 'p2p', lineIds(f.ice).join(','));
   check('未配 TURN → 没有 TURN 条目', turnHosts(f.ice).length === 0);
+
+  /* 7. 强制中继策略：选 TURN → relay，选 P2P → all */
+  const g = await iceOrder(env, PORT + 17, 'sh');
+  check('选上海 → iceTransportPolicy=relay', !!(g.ice && g.ice.iceTransportPolicy === 'relay'),
+    String(g.ice && g.ice.iceTransportPolicy));
+  const h = await iceOrder(env, PORT + 18, 'p2p');
+  check('选 P2P → iceTransportPolicy=all', !!(h.ice && h.ice.iceTransportPolicy === 'all'),
+    String(h.ice && h.ice.iceTransportPolicy));
+  check('P2P 仍带各节点的纯 STUN（内地打洞兜底）',
+    JSON.stringify(h.ice || {}).includes('203.0.113.20') && !turnHosts(h.ice).length,
+    JSON.stringify(h.ice || {}).slice(0, 200));
+
+  /* 8. 主播端忽略 turn 参数：不管传什么，都固定用默认线路 */
+  const i = await iceOrder(env, PORT + 19, 'hk', 'host');
+  check('主播端固定默认线路（不受 turn=hk 影响）',
+    !!(i.ice && i.ice.line === 'sh') && turnHosts(i.ice).join(',') === '203.0.113.20',
+    JSON.stringify({ line: i.ice && i.ice.line, hosts: turnHosts(i.ice) }));
 }

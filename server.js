@@ -287,18 +287,28 @@ function pickLine(lineId) {
   return findLine(want) || defaultLine();
 }
 
-function icePayload(lineId) {
-  const line = pickLine(lineId);
+function icePayload(lineId, role) {
+  /* 主播端不随观众切换线路：主播固定用 TURN_DEFAULT，
+     否则一端 relay 一端 stun，双方候选集对不上，观众会黑屏。 */
+  const isViewer = role === 'viewer';
+  const line = pickLine(isViewer ? lineId : '');
   const servers = [{ urls: DEFAULT_STUN.slice() }];
 
   if (line) {
     servers.push({ urls: [`stun:${line.host}:${line.port}`] });
     servers.push(turnEntry(line.host, line.port, line.secret));
+  } else {
+    /* p2p 线路：一个 TURN 都不给，只把各节点当纯 STUN 用，
+       让内地观众能拿到公网候选、提高直连成功率（STUN 不是中继，不违背纯直连语义）。 */
+    for (const l of TURN_LINES) servers.push({ urls: [`stun:${l.host}:${l.port}`] });
   }
 
   return {
     iceServers: servers,
     ttl: TURN_TTL_SEC,
+    /* 选了 TURN 线路就强制只用中继候选：否则浏览器能直连时会优先直连，
+       明明选了上海却显示 P2P。p2p 线路保持 all，让浏览器自由打洞。 */
+    iceTransportPolicy: line ? 'relay' : 'all',
     /* line 是本次真正生效的线路，lines 是可选清单（前端据此画下拉） */
     line: line ? line.id : 'p2p',
     lines: lineOptions()
@@ -562,7 +572,7 @@ function handleEvents(req, res, url) {
      EventSource 断线重连会让 welcome 再来一遍，不能只在第一次生效。
      TODO(安全)：EventSource 不支持自定义 POST，host 的口令只能留在 query 里，
      会进反向代理的访问日志。等改为「/api/auth 换短期 token → SSE 带 token」后去掉。 */
-  sendTo(id, 'welcome', { id, role, ice: icePayload(turn), ...statePayload() });
+  sendTo(id, 'welcome', { id, role, ice: icePayload(turn, role), ...statePayload() });
   sendTo(id, 'history', chatLog.slice(-80));
   if (role === 'viewer') {
     if (stream.live && stream.hostId && stream.hostId !== id) {

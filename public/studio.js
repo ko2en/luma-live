@@ -10,6 +10,7 @@
       { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
       { urls: 'stun:global.stun.twilio.com:3478' }
     ],
+    iceTransportPolicy: 'all',  /* welcome 收到前先用默认；收到后由服务端决定 */
     lines: [],   /* 服务端下发的可选线路，用来填下拉 */
     line: 'p2p'  /* 本次实际生效的线路 */
   };
@@ -19,7 +20,8 @@
     const list = Array.isArray(cfg) ? cfg : cfg.iceServers;
     if (!Array.isArray(list) || !list.length) return;
     ICE.iceServers = list;
-    /* line / lines 服务端下发：本次生效的线路 + 全部可选线路 */
+    ICE.iceTransportPolicy = !Array.isArray(cfg) && cfg.iceTransportPolicy === 'relay' ? 'relay' : 'all';
+    /* line / lines 服务端下发：本次生效的线路 + 全部可选线路（主播端只用来标注节点名） */
     ICE.line = !Array.isArray(cfg) && typeof cfg.line === 'string' && cfg.line ? cfg.line : 'p2p';
     ICE.lines = !Array.isArray(cfg) && Array.isArray(cfg.lines) ? cfg.lines : [];
   }
@@ -68,7 +70,6 @@
     keyState: $('[data-key-state]'),
     taken: $('[data-taken-over]'),
     takeOverBtn: $('[data-take-over]'),
-    turnPick: $('[data-turn-pick]'),
     toast: $('[data-toast]')
   };
 
@@ -1196,7 +1197,10 @@
     if (!localStream || !live) return;
     closePeer(viewerId);
 
-    const pc = new RTCPeerConnection(ICE);
+    const pc = new RTCPeerConnection({
+      iceServers: ICE.iceServers,
+      iceTransportPolicy: ICE.iceTransportPolicy
+    });
     pc.__tier = 'high';
     pc.__relay = false;
     pc.__relayNode = '';
@@ -1239,75 +1243,6 @@
     }
   }
 
-  /* ================= 中继线路 ================= */
-
-  /* 线路由服务端下发（P2P / 各 TURN 入口），主播这边选哪条就只推哪条。
-     选择记在本机 localStorage，重连时以 turn=<线路 id> 告诉服务端。 */
-  const TURN_KEY = 'luma.turn';
-  let turnLine = readTurnPref();
-
-  function readTurnPref() {
-    try {
-      return localStorage.getItem(TURN_KEY) || '';
-    } catch (err) {
-      return '';
-    }
-  }
-
-  function writeTurnPref(v) {
-    try {
-      if (!v || v === 'p2p') localStorage.removeItem(TURN_KEY);
-      else localStorage.setItem(TURN_KEY, v);
-    } catch (err) { /* 隐私模式写不进去，当次有效即可 */ }
-  }
-
-  function paintTurnPick() {
-    if (!el.turnPick) return;
-    const lines = ICE.lines || [];
-    if (lines.length < 2) {
-      el.turnPick.hidden = true;
-      return;
-    }
-    el.turnPick.hidden = false;
-
-    const sig = lines.map((l) => `${l.id}:${l.title}`).join(',');
-    if (el.turnPick.dataset.built !== sig) {
-      el.turnPick.textContent = '';
-      lines.forEach((l) => {
-        const opt = document.createElement('option');
-        opt.value = l.id;
-        opt.textContent = l.title || l.id;
-        el.turnPick.appendChild(opt);
-      });
-      el.turnPick.dataset.built = sig;
-    }
-
-    const want = ICE.line || 'p2p';
-    if (el.turnPick.value !== want) el.turnPick.value = want;
-    el.turnPick.dataset.line = want;
-    el.turnPick.title = `当前线路：${(lines.find((l) => l.id === want) || {}).title || want}`;
-  }
-
-  function syncTurnLine(ice) {
-    if (!ice) return;
-    const actual = ice.line || 'p2p';
-    turnLine = actual;
-    if (readTurnPref() && readTurnPref() !== actual) writeTurnPref(actual);
-  }
-
-  function switchLine(id) {
-    turnLine = id;
-    writeTurnPref(id);
-    paintTurnPick();
-    /* 换线路要重建全部 peer：ICE 配置只在新建 RTCPeerConnection 时读取 */
-    closeAllPeers();
-    connect(false);
-  }
-
-  if (el.turnPick) {
-    el.turnPick.addEventListener('change', () => switchLine(el.turnPick.value));
-  }
-
   /* ================= 事件流 ================= */
 
   let reconnectTimer = null;
@@ -1345,8 +1280,7 @@
     /* TODO(安全)：EventSource 不能带 body，口令只能留在 query 里，会进反代访问日志。
        等接上「/api/auth 换短期 token → SSE 带 token」后改成 token。 */
     const tk = takeover ? '&takeover=1' : '';
-    const turnQ = turnLine ? `&turn=${encodeURIComponent(turnLine)}` : '';
-    es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}${tk}${turnQ}`);
+    es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}${tk}`);
 
     /* 服务端切断这条连接之前会先发这一帧：说明不是网络抖动，是被接管了 */
     es.addEventListener('host-taken', () => handleHostTaken());
@@ -1354,8 +1288,6 @@
     es.addEventListener('welcome', (e) => {
       const data = JSON.parse(e.data);
       applyIce(data.ice);
-      syncTurnLine(data.ice);
-      paintTurnPick();
       if (data.title) el.title.value = data.title;
       if (data.startedAt) startedAt = data.startedAt;
       if (keyRequired) setKeyState('口令正确', 'ok');

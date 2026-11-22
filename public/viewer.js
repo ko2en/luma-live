@@ -11,6 +11,7 @@
       { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
       { urls: 'stun:global.stun.twilio.com:3478' }
     ],
+    iceTransportPolicy: 'all',  /* welcome 收到前先用默认；收到后由服务端决定 */
     lines: [],   /* 服务端下发的可选线路，用来填下拉 */
     line: 'p2p'  /* 本次实际生效的线路 */
   };
@@ -20,6 +21,9 @@
     const list = Array.isArray(cfg) ? cfg : cfg.iceServers;
     if (!Array.isArray(list) || !list.length) return;
     ICE.iceServers = list;
+    /* 选了 TURN 线路就只收集 relay 候选，浏览器不会再偷偷走直连；
+       这样「选上海」才真的走上海中继，状态标签也不会显示成 P2P。 */
+    ICE.iceTransportPolicy = !Array.isArray(cfg) && cfg.iceTransportPolicy === 'relay' ? 'relay' : 'all';
     /* line / lines 服务端下发：本次生效的线路 + 全部可选线路 */
     ICE.line = !Array.isArray(cfg) && typeof cfg.line === 'string' && cfg.line ? cfg.line : 'p2p';
     ICE.lines = !Array.isArray(cfg) && Array.isArray(cfg.lines) ? cfg.lines : [];
@@ -447,7 +451,10 @@
   }
 
   function createPeer() {
-    const peer = new RTCPeerConnection(ICE);
+    const peer = new RTCPeerConnection({
+      iceServers: ICE.iceServers,
+      iceTransportPolicy: ICE.iceTransportPolicy
+    });
 
     peer.onicecandidate = (e) => {
       if (e.candidate && hostId) postSignal(hostId, { candidate: e.candidate });
@@ -590,6 +597,9 @@
   function switchLine(id) {
     turnLine = id;
     writeTurnPref(id);
+    /* 立刻把下拉切到新值，别等服务端 welcome 回来（那要一两秒，看起来像没生效） */
+    ICE.line = id;
+    ICE.iceTransportPolicy = id === 'p2p' ? 'all' : 'relay';
     paintTurnPick();
     /* 换线路必须重建：ICE 配置只在新建 RTCPeerConnection 时生效 */
     reconnectIce();
@@ -710,8 +720,12 @@
     const local = byId.get(pair.localCandidateId);
     const remote = byId.get(pair.remoteCandidateId);
     const types = [local && local.candidateType, remote && remote.candidateType];
-    const connectionType = types.includes('relay') ? 'relay'
-      : types.every((type) => ['host', 'srflx', 'prflx'].includes(type)) ? 'direct' : 'unknown';
+    let connectionType = 'unknown';
+    if (types.includes('relay')) connectionType = 'relay';
+    else if (types.every((type) => ['host', 'srflx', 'prflx'].includes(type))) connectionType = 'direct';
+    /* 选了 TURN 线路但 stats 读不到候选类型（部分浏览器 remotecandidate 不暴露）：
+       既然是强制中继配置，按中继算，不要误报成 P2P。 */
+    if (connectionType === 'unknown' && ICE.iceTransportPolicy === 'relay') connectionType = 'relay';
     /* 中继候选的 address 就是 TURN 给的那段地址，等于节点本身的公网 IP；
        带回去让主播端能标出「这一路走的是哪条中继」 */
     const relaySide = [local, remote].find((c) => c && c.candidateType === 'relay');
@@ -724,9 +738,11 @@
 
   /* 把中继 IP 换成人看得懂的名字，取不到就退回 IP */
   function relayLabel(addr) {
-    if (!addr) return '';
-    const hit = (ICE.lines || []).find((l) => l && l.host === addr);
-    return hit ? (hit.title || hit.id) : addr;
+    const hit = addr ? (ICE.lines || []).find((l) => l && l.host === addr) : null;
+    if (hit) return hit.title || hit.id;
+    /* stats 里的地址可能是 coturn 分的内网 relay IP，匹配不到就退回当前线路名 */
+    const cur = (ICE.lines || []).find((l) => l && l.id === ICE.line && l.id !== 'p2p');
+    return cur ? (cur.title || cur.id) : (addr || '');
   }
 
   async function sampleLink() {
