@@ -34,48 +34,51 @@ const AUTH_MAP_MAX = 1000;
    所有请求的来源都是代理本身，要设 TRUST_PROXY=1 才读 X-Forwarded-For。 */
 const TRUST_PROXY = process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true';
 
-/* ---------------- TURN（全部可选，不配就完全走原来的 STUN 直连） ----------------
-   TURN_HOST 一旦设置，welcome 事件里就会带上服务端生成的 iceServers，
-   凭证按 coturn 的 REST API 方式（static-auth-secret）用 HMAC-SHA1 现签，
-   有效期 6 小时。没有 TURN_STATIC_AUTH_SECRET 时退化成无凭证的匿名中继。 */
-const TURN_HOST = String(process.env.TURN_HOST || '').trim();
-const TURN_PORT = String(process.env.TURN_PORT || '3478').trim();
-const TURN_TLS_PORT = String(process.env.TURN_TLS_PORT || '5349').trim();
-const TURN_STATIC_AUTH_SECRET = String(process.env.TURN_STATIC_AUTH_SECRET || '').trim();
+/* ---------------- TURN 线路（全部可选，不配就完全走 STUN 直连） ----------------
+   一条线路 = 一个 TURN 入口。TURN_LINES 用 `id|host|port|secret|标题` 描述，
+   多条用逗号分隔；secret 留空表示匿名中继。p2p 是内置线路：
+   只下发 STUN、不给任何 TURN，通不通全看两边能不能打洞。
+   凭证按 coturn 的 REST 方式（static-auth-secret）用 HMAC-SHA1 现签，6 小时有效。 */
 const TURN_TTL_SEC = 6 * 60 * 60;
 const TURN_USER = 'luma';
 
-/* 附加 TURN 节点（多线路择优）：TURN_EXTRA="host:port:secret[:label],host:port:secret[:label]"
-   label 只是给人看的状态栏名字，取不到就用 host 本身。
-   注意：这些节点必须公网可达，且 relay 端口要和映射一一对应，否则候选是死的。 */
-const TURN_EXTRA = String(process.env.TURN_EXTRA || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean)
-  .map((s) => {
-    const [host, port, secret, label] = s.split(':');
-    return {
-      host: (host || '').trim(),
-      port: (port || '3478').trim(),
-      secret: (secret || '').trim(),
-      label: (label || '').trim()
-    };
-  })
-  .filter((t) => t.host);
+function parseTurnLines(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((x) => {
+      const [id, host, port, secret, title] = x.split('|').map((v) => String(v || '').trim());
+      return { id: id || host, host, port: port || '3478', secret, title: title || id || host };
+    })
+    .filter((l) => l.host);
+}
 
-/* 首选节点：TURN_PREFER 填节点 host（如 1.2.3.4）或 kind（main / extra）或显示名。
-   浏览器给 relay 候选的 ICE 优先级是一样的，基本上「谁先分配成功、先连通就用谁」；
-   把首选节点排在 iceServers 最前面能让它先开始收集，真实测下来近端节点几乎总胜出。
-   首选节点拒绝分配（端口用尽、网络不通）时，同一份 iceServers 里的其它节点仍然兜底。 */
-const TURN_PREFER = String(process.env.TURN_PREFER || '').trim();
+const TURN_LINES = parseTurnLines(process.env.TURN_LINES);
+
+/* 兼容老部署：只配了 TURN_HOST / TURN_EXTRA 时，把它们转成线路 */
+const TURN_HOST = String(process.env.TURN_HOST || '').trim();
+const TURN_PORT = String(process.env.TURN_PORT || '3478').trim();
+const TURN_STATIC_AUTH_SECRET = String(process.env.TURN_STATIC_AUTH_SECRET || '').trim();
 const TURN_LABEL = String(process.env.TURN_LABEL || '').trim();
+if (!TURN_LINES.length && TURN_HOST) {
+  TURN_LINES.push({
+    id: 'main', host: TURN_HOST, port: TURN_PORT,
+    secret: TURN_STATIC_AUTH_SECRET, title: TURN_LABEL || '主线路'
+  });
+  for (const raw of String(process.env.TURN_EXTRA || '').split(',')) {
+    const [host, port, secret, label] = raw.split(':');
+    if (!host || !host.trim()) continue;
+    const id = (label || host).trim();
+    TURN_LINES.push({
+      id, host: host.trim(), port: (port || '3478').trim(),
+      secret: (secret || '').trim(), title: id
+    });
+  }
+}
 
-/* 强制线路：TURN_ONLY 只把这一个节点下发给客户端，其余节点不参与协商。
-   取值：host / kind（main|extra）/ 显示名；填 all 或留空 = 不过滤（旧行为）。
-   场景：内地观众明明该走内地中继，却因为香港那条候选先连通而绕出国再回来，
-   所以默认只给最近的那条。有人网络到那条不通时，页面上的「线路」按钮
-   （或 ?turn=<host|label|all>）可以当场切回其它节点，不必改服务器配置。 */
-const TURN_ONLY = String(process.env.TURN_ONLY || '').trim();
+/* 默认线路：TURN_DEFAULT 填线路 id；不设就用第一条 TURN 线路（没有就是 p2p） */
+const TURN_DEFAULT = String(process.env.TURN_DEFAULT || '').trim();
 
 /* 默认 STUN：不配 TURN 时就是这一份，行为和以前完全一致 */
 const DEFAULT_STUN = [
@@ -238,15 +241,13 @@ function tooMany(res, leftMs) {
  * ICE 配置（服务端下发，避免把 TURN 凭证硬编码到前端）
  * ------------------------------------------------------------------ */
 
-/* 单个 TURN 节点的 iceServers 条目；凭证按 coturn REST 方式现签 */
-function turnEntry(host, port, secret, tlsPort) {
+/* 单条线路的 iceServers 条目；凭证按 coturn REST 方式现签 */
+function turnEntry(host, port, secret) {
   /* coturn 与 TURN 共用同一端口，顺手当 STUN 用：部分网络里 Google 的 STUN 不可达 */
   const urls = [
     `turn:${host}:${port}?transport=udp`,
     `turn:${host}:${port}?transport=tcp`
   ];
-  if (tlsPort && tlsPort !== '0') urls.push(`turns:${host}:${tlsPort}?transport=tcp`);
-
   const entry = { urls };
   if (secret) {
     /* coturn REST 凭证：username = "<过期时间戳>:<用户名>"，
@@ -258,87 +259,49 @@ function turnEntry(host, port, secret, tlsPort) {
   return entry;
 }
 
-/* 节点匹配：host / kind / 显示名都认，大小写不敏感 */
-function matchNode(node, want) {
-  const w = String(want || '').trim().toLowerCase();
-  if (!w) return false;
-  return node.host.toLowerCase() === w
-    || node.kind === w
-    || String(node.label || '').toLowerCase() === w;
+/* 可选线路清单：p2p 永远排第一，后面按配置顺序 */
+function lineOptions() {
+  /* host 也带上：前端用它把 stats 里的中继地址翻译成线路名 */
+  return [{ id: 'p2p', title: 'P2P 直连', host: '' }]
+    .concat(TURN_LINES.map((l) => ({ id: l.id, title: l.title, host: l.host })));
 }
 
-/* 全部可用节点（已按 TURN_PREFER 排好序） */
-function allNodes() {
-  const nodes = [];
-  if (TURN_HOST) {
-    nodes.push({
-      host: TURN_HOST, port: TURN_PORT, secret: TURN_STATIC_AUTH_SECRET,
-      tls: TURN_TLS_PORT, kind: 'main', label: TURN_LABEL || 'main'
-    });
-  }
-  for (const t of TURN_EXTRA) {
-    nodes.push({ host: t.host, port: t.port, secret: t.secret, tls: '0', kind: 'extra', label: t.label || t.host });
-  }
-
-  /* 首选节点挪到最前；找不到就保持原顺序，不报错也不影响兜底 */
-  if (TURN_PREFER && nodes.length > 1) {
-    const want = TURN_PREFER.toLowerCase();
-    const idx = nodes.findIndex((n) =>
-      n.host.toLowerCase() === want || n.kind === want || n.label.toLowerCase() === want);
-    if (idx > 0) {
-      const [pick] = nodes.splice(idx, 1);
-      nodes.unshift(pick);
-    }
-  }
-  return nodes;
+function findLine(id) {
+  const want = String(id || '').trim().toLowerCase();
+  if (!want) return null;
+  return TURN_LINES.find((l) => l.id.toLowerCase() === want) || null;
 }
 
-/* 本次连接实际下发的节点。
-   scope 来自 URL 的 turn 参数：auto（默认，按 TURN_ONLY）/ all / host|kind|label。
-   手动指定优先于服务器上的强制设置；指定的节点不存在时退回默认，不至于连不上。 */
-function iceNodes(scope) {
-  const nodes = allNodes();
-  if (nodes.length <= 1) return nodes;
-
-  const want = String(scope || '').trim().toLowerCase();
-  if (want === 'all') return nodes;
-  if (want && want !== 'auto') {
-    const picked = nodes.filter((n) => matchNode(n, want));
-    if (picked.length) return picked;
+function defaultLine() {
+  if (TURN_DEFAULT) {
+    const hit = findLine(TURN_DEFAULT);
+    if (hit) return hit;
   }
-
-  const forced = TURN_ONLY.toLowerCase();
-  if (forced && forced !== 'all') {
-    const picked = nodes.filter((n) => matchNode(n, forced));
-    if (picked.length) return picked;
-  }
-  return nodes;
+  return TURN_LINES[0] || null;
 }
 
-function icePayload(scope) {
-  const all = allNodes();
-  const nodes = iceNodes(scope);
+/* lineId 为空 = 服务器默认线路；p2p = 不给 TURN；写了不存在的 id = 退回默认线路 */
+function pickLine(lineId) {
+  const want = String(lineId || '').trim();
+  if (want.toLowerCase() === 'p2p') return null;
+  return findLine(want) || defaultLine();
+}
+
+function icePayload(lineId) {
+  const line = pickLine(lineId);
   const servers = [{ urls: DEFAULT_STUN.slice() }];
 
-  for (const node of nodes) {
-    servers.push({ urls: [`stun:${node.host}:${node.port}`] });
-    servers.push(turnEntry(node.host, node.port, node.secret, node.tls));
+  if (line) {
+    servers.push({ urls: [`stun:${line.host}:${line.port}`] });
+    servers.push(turnEntry(line.host, line.port, line.secret));
   }
 
-  const active = nodes.map((n) => n.host);
   return {
     iceServers: servers,
     ttl: TURN_TTL_SEC,
-    /* nodes 给的是全部节点（含 active 标记），前端据此画「线路」切换按钮：
-       只有一条可用时按钮不出现，多于一条时点一下就能换。 */
-    nodes: all.map((n) => ({
-      host: n.host, port: n.port, label: n.label, kind: n.kind,
-      active: active.includes(n.host)
-    })),
-    preferred: nodes.length ? nodes[0].host : '',
-    /* 是否被限制成「只走部分节点」，以及当前生效的是哪条 */
-    forced: active.length > 0 && active.length < all.length,
-    scope: nodes.length && nodes.length === all.length ? 'all' : (nodes[0] ? nodes[0].label : '')
+    /* line 是本次真正生效的线路，lines 是可选清单（前端据此画下拉） */
+    line: line ? line.id : 'p2p',
+    lines: lineOptions()
   };
 }
 
@@ -525,9 +488,9 @@ function handleEvents(req, res, url) {
   const id = (url.searchParams.get('id') || '').slice(0, 64);
   const role = url.searchParams.get('role') === 'host' ? 'host' : 'viewer';
   const name = (url.searchParams.get('name') || '访客').slice(0, 24);
-  /* 线路：页面上的「线路」按钮切换后会带 turn=<host|label|all> 重连。
-     不传就是 auto —— 按服务器上的 TURN_ONLY 走默认线路。 */
-  const turn = (url.searchParams.get('turn') || 'auto').slice(0, 32);
+  /* 线路：页面上的下拉选中后会带 turn=<线路 id> 重连（p2p 表示不要 TURN）。
+     不传就用服务器默认线路。 */
+  const turn = (url.searchParams.get('turn') || '').slice(0, 32);
 
   if (!id) return json(res, 400, { error: 'missing id' });
   const previous = clients.get(id);
@@ -924,41 +887,16 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log('            公网部署请设置环境变量 STREAM_KEY=你的口令');
   }
   if (HOST_GRACE_MS) console.log(`  断线宽限  ${HOST_GRACE_MS} ms（主播掉线后不立即结束直播）`);
-  if (TURN_HOST) {
-    const chans = ['udp', 'tcp'];
-    if (TURN_TLS_PORT && TURN_TLS_PORT !== '0') chans.push('tls');
-    console.log(`  TURN 中继 ${TURN_HOST}:${TURN_PORT} · ${chans.join('/')} · 最近凭证 ${TURN_TTL_SEC / 3600}h`);
-    if (!TURN_STATIC_AUTH_SECRET) {
-      console.log('            未设 TURN_STATIC_AUTH_SECRET —— 用匿名中继，coturn 需开 no-auth');
+  if (TURN_LINES.length) {
+    for (const l of TURN_LINES) {
+      const mark = l.secret ? 'REST 凭证' : '匿名中继';
+      console.log(`  TURN 线路  ${l.id}（${l.title}）→ ${l.host}:${l.port} · ${mark}`);
     }
-  } else if (!TURN_EXTRA.length) {
-    console.log('  TURN 中继 未配置 —— 打洞失败的观众会黑屏（设 TURN_HOST 可补上）');
-  }
-  /* 附加节点单独列出，方便一眼看出多线路是否都吃到了 */
-  for (const t of TURN_EXTRA) {
-    const mark = t.secret ? 'REST 凭证' : '匿名中继';
-    console.log(`  TURN 附加 ${t.host}:${t.port} · udp/tcp · ${mark}${t.label ? ` · ${t.label}` : ''}`);
-  }
-  const turnOrder = allNodes();
-  if (turnOrder.length > 1) {
-    const names = turnOrder.map((n) => `${n.label}(${n.host})`).join(' → ');
-    if (TURN_ONLY && TURN_ONLY.toLowerCase() !== 'all') {
-      const only = iceNodes('auto');
-      if (only.length === 1) {
-        console.log(`  中继线路  只用 ${only[0].label}(${only[0].host}) —— 其余节点只在页面上手动切换时才下发`);
-      } else {
-        console.log(`  中继线路  只下发 ${only.map((n) => n.label).join('+')}（TURN_ONLY=${TURN_ONLY}）`);
-      }
-      console.log(`            全部备选  ${names}`);
-    } else {
-      console.log(`  中继顺序  ${names}`);
-      if (TURN_PREFER) {
-        console.log(`            首选 ${turnOrder[0].label} —— 排在 iceServers 最前，先完成分配的先被选中`);
-      } else {
-        console.log('            想让某个节点优先，设 TURN_PREFER=<host|main|extra|label>');
-      }
-      console.log('            想让其它节点只在手动切换时出现，设 TURN_ONLY=<host|main|extra|label>');
-    }
+    const def = defaultLine();
+    console.log(`  默认线路  ${def ? `${def.id}（${def.title}）` : 'p2p'} —— 页面上的「线路」随时可换`);
+    console.log('            TURN_DEFAULT 可改默认线路；p2p 只给 STUN，不给 TURN');
+  } else {
+    console.log('  TURN 中继 未配置 —— 打洞失败的观众会黑屏（设 TURN_LINES 可补上）');
   }
   if (AUTH_LOCK_MS) console.log(`  口令限速 ${AUTH_MAX_FAILS} 次失败锁 ${AUTH_LOCK_MS / 1000}s${TRUST_PROXY ? '（读 X-Forwarded-For）' : ''}`);
 });

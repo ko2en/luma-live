@@ -11,8 +11,8 @@
       { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
       { urls: 'stun:global.stun.twilio.com:3478' }
     ],
-    nodes: [],  /* 服务端下发的节点清单，用来标注线路与提供切换选项 */
-    scope: 'all' /* 服务端本次实际下发的线路：'all' 或某个节点名 */
+    lines: [],   /* 服务端下发的可选线路，用来填下拉 */
+    line: 'p2p'  /* 本次实际生效的线路 */
   };
 
   function applyIce(cfg) {
@@ -20,9 +20,9 @@
     const list = Array.isArray(cfg) ? cfg : cfg.iceServers;
     if (!Array.isArray(list) || !list.length) return;
     ICE.iceServers = list;
-    ICE.nodes = !Array.isArray(cfg) && Array.isArray(cfg.nodes) ? cfg.nodes : [];
-    /* scope 是服务端算出来的「本次实际生效的线路」，用来画切换按钮的当前值 */
-    ICE.scope = !Array.isArray(cfg) && typeof cfg.scope === 'string' && cfg.scope ? cfg.scope : 'all';
+    /* line / lines 服务端下发：本次生效的线路 + 全部可选线路 */
+    ICE.line = !Array.isArray(cfg) && typeof cfg.line === 'string' && cfg.line ? cfg.line : 'p2p';
+    ICE.lines = !Array.isArray(cfg) && Array.isArray(cfg.lines) ? cfg.lines : [];
   }
 
   const el = {
@@ -172,13 +172,14 @@
   }
 
   function paintConnection(type, nodeLabel) {
+    /* 连上了却没有 relay 候选，就是直连 —— 不再显示「检测中」这种中间态 */
+    if (type === 'unknown') type = 'direct';
     const labels = {
-      idle: ['未连接', '媒体尚未连接，是否使用 TURN 中继尚未确定。'],
-      connecting: ['连接中', '正在建立媒体连接，是否使用 TURN 中继尚未确定。'],
-      unknown: ['检测中', '媒体路径统计不足，暂不能确定是否使用 TURN 中继。'],
+      idle: ['未连接', '媒体尚未连接。'],
+      connecting: ['连接中', '正在建立媒体连接。'],
       direct: ['P2P直连', '媒体在双方之间直接传输，不经过 TURN 中继。'],
       relay: ['TURN中继', '媒体经过 TURN 服务器中继，任一端使用中继即计为 TURN。'],
-      reconnecting: ['断开重连中', '媒体连接已断开，正在恢复；旧路径状态已清除。']
+      reconnecting: ['断开重连中', '媒体连接已断开，正在恢复。']
     };
     let [text, title] = labels[type];
     if (type === 'relay' && nodeLabel) {
@@ -529,69 +530,66 @@
 
   /* ================= 中继线路 ================= */
 
-  /* 服务端默认只下发一条中继（TURN_ONLY），这里让人能临时换一条：
-     选择只记在本机 localStorage，重连时以 turn= 参数告诉服务端，
-     只影响这台设备，不会改别人的线路。 */
+  /* 服务端下发可选线路（P2P / 各 TURN 入口），这里只负责选哪一条：
+     选择记在本机 localStorage，重连时以 turn=<线路 id> 告诉服务端。
+     选 P2P 就不给任何 TURN，打洞不通就一直停在那儿，由人自己换线。 */
   const TURN_KEY = 'luma.turn';
-  let turnScope = readTurnPref();
+  let turnLine = readTurnPref();
 
   function readTurnPref() {
     try {
-      return localStorage.getItem(TURN_KEY) || 'auto';
+      return localStorage.getItem(TURN_KEY) || '';
     } catch (err) {
-      return 'auto';
+      return '';
     }
   }
 
   function writeTurnPref(v) {
     try {
-      if (!v || v === 'auto') localStorage.removeItem(TURN_KEY);
+      if (!v || v === 'p2p') localStorage.removeItem(TURN_KEY);
       else localStorage.setItem(TURN_KEY, v);
-    } catch (err) { /* 隐私模式下写不进去，当次有效即可 */ }
-  }
-
-  /* 可切换的线路名（不含「自动」） */
-  function turnOptions() {
-    const list = (ICE.nodes || []).map((n) => n && (n.label || n.host)).filter(Boolean);
-    return Array.from(new Set(list));
+    } catch (err) { /* 隐私模式写不进去，当次有效即可 */ }
   }
 
   function paintTurnPick() {
     if (!el.turnPick) return;
-    const opts = turnOptions();
-    /* 只有一条线就没得切，不占地方 */
-    if (opts.length < 2) {
+    const lines = ICE.lines || [];
+    /* 只有 P2P 一条（没配 TURN 的部署）就不显示 */
+    if (lines.length < 2) {
       el.turnPick.hidden = true;
       return;
     }
     el.turnPick.hidden = false;
-    const actual = ICE.scope || 'all';
-    const text = actual === 'all' ? '线路 自动' : `线路 ${actual}`;
-    if (el.turnPick.textContent !== text) el.turnPick.textContent = text;
-    el.turnPick.dataset.turn = actual;
-    el.turnPick.title = `当前中继线路：${actual === 'all' ? '全部节点自动选择' : actual}`
-      + `；点击切换（${opts.join(' / ')} / 自动）`;
-  }
 
-  /* 服务端实际生效的线路若与本地偏好不一致（节点没了），以服务端为准 */
-  function syncTurnScope(ice) {
-    if (!ice) return;
-    const actual = ice.scope || 'all';
-    if (turnScope !== 'auto' && turnScope !== actual) {
-      turnScope = actual === 'all' ? 'auto' : actual;
-      writeTurnPref(turnScope);
+    const sig = lines.map((l) => `${l.id}:${l.title}`).join(',');
+    if (el.turnPick.dataset.built !== sig) {
+      el.turnPick.textContent = '';
+      lines.forEach((l) => {
+        const opt = document.createElement('option');
+        opt.value = l.id;
+        opt.textContent = l.title || l.id;
+        el.turnPick.appendChild(opt);
+      });
+      el.turnPick.dataset.built = sig;
     }
+
+    const want = ICE.line || 'p2p';
+    if (el.turnPick.value !== want) el.turnPick.value = want;
+    el.turnPick.dataset.line = want;
+    el.turnPick.title = `当前线路：${(lines.find((l) => l.id === want) || {}).title || want}`;
   }
 
-  function switchTurn() {
-    /* 候选：上海 → 香港 → 自动（全部节点还给浏览器自己挑）→ 上海 …
-       当前值取服务端实际生效的线路，所以第一次点一定是「切到另一条真实的线」。 */
-    const seq = turnOptions().concat(['all']);
-    const cur = ICE.scope || 'all';
-    const i = seq.indexOf(cur);
-    turnScope = seq[(i + 1) % seq.length] || 'all';
-    writeTurnPref(turnScope);
-    ICE.scope = turnScope;   // 立刻反映到按钮上，不用等服务端回包
+  /* 服务端实际生效的线路若与本地记录不同（线路被删/改名），以服务端为准 */
+  function syncTurnLine(ice) {
+    if (!ice) return;
+    const actual = ice.line || 'p2p';
+    turnLine = actual;
+    if (readTurnPref() && readTurnPref() !== actual) writeTurnPref(actual);
+  }
+
+  function switchLine(id) {
+    turnLine = id;
+    writeTurnPref(id);
     paintTurnPick();
     /* 换线路必须重建：ICE 配置只在新建 RTCPeerConnection 时生效 */
     reconnectIce();
@@ -607,8 +605,7 @@
   }
 
   if (el.turnPick) {
-    el.turnPick.addEventListener('click', switchTurn);
-    paintTurnPick();
+    el.turnPick.addEventListener('change', () => switchLine(el.turnPick.value));
   }
 
   /* ================= 事件流 ================= */
@@ -616,7 +613,7 @@
   let es = null;
 
   function connect() {
-    const turnQ = turnScope && turnScope !== 'auto' ? `&turn=${encodeURIComponent(turnScope)}` : '';
+    const turnQ = turnLine ? `&turn=${encodeURIComponent(turnLine)}` : '';
     es = new EventSource(
       `/api/events?role=viewer&id=${encodeURIComponent(clientId)}&name=${encodeURIComponent(nickname)}${turnQ}`
     );
@@ -624,7 +621,7 @@
     es.addEventListener('welcome', (e) => {
       const data = JSON.parse(e.data);
       applyIce(data.ice);
-      syncTurnScope(data.ice);
+      syncTurnLine(data.ice);
       paintTurnPick();
       applyState(data);
       el.chatList.querySelectorAll('.msg, .msg-notice').forEach((n) => n.remove());
@@ -728,8 +725,8 @@
   /* 把中继 IP 换成人看得懂的名字，取不到就退回 IP */
   function relayLabel(addr) {
     if (!addr) return '';
-    const hit = (ICE.nodes || []).find((n) => n && n.host === addr);
-    return hit ? (hit.label || hit.host) : addr;
+    const hit = (ICE.lines || []).find((l) => l && l.host === addr);
+    return hit ? (hit.title || hit.id) : addr;
   }
 
   async function sampleLink() {

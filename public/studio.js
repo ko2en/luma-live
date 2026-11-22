@@ -10,8 +10,8 @@
       { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
       { urls: 'stun:global.stun.twilio.com:3478' }
     ],
-    nodes: [],  /* 服务端下发的节点清单，用来标注线路与提供切换选项 */
-    scope: 'all' /* 服务端本次实际下发的线路：'all' 或某个节点名 */
+    lines: [],   /* 服务端下发的可选线路，用来填下拉 */
+    line: 'p2p'  /* 本次实际生效的线路 */
   };
 
   function applyIce(cfg) {
@@ -19,16 +19,16 @@
     const list = Array.isArray(cfg) ? cfg : cfg.iceServers;
     if (!Array.isArray(list) || !list.length) return;
     ICE.iceServers = list;
-    ICE.nodes = !Array.isArray(cfg) && Array.isArray(cfg.nodes) ? cfg.nodes : [];
-    /* scope 是服务端算出来的「本次实际生效的线路」，用来画切换按钮的当前值 */
-    ICE.scope = !Array.isArray(cfg) && typeof cfg.scope === 'string' && cfg.scope ? cfg.scope : 'all';
+    /* line / lines 服务端下发：本次生效的线路 + 全部可选线路 */
+    ICE.line = !Array.isArray(cfg) && typeof cfg.line === 'string' && cfg.line ? cfg.line : 'p2p';
+    ICE.lines = !Array.isArray(cfg) && Array.isArray(cfg.lines) ? cfg.lines : [];
   }
 
   /* 中继 IP → 节点显示名 */
   function relayLabel(addr) {
     if (!addr) return '';
-    const hit = (ICE.nodes || []).find((n) => n && n.host === addr);
-    return hit ? (hit.label || hit.host) : addr;
+    const hit = (ICE.lines || []).find((l) => l && l.host === addr);
+    return hit ? (hit.title || hit.id) : addr;
   }
 
   const el = {
@@ -945,11 +945,12 @@
   }
 
   function paintConnections() {
-    const counts = { direct: 0, relay: 0, unknown: 0 };
-    const relayNodes = new Map();   // 中继节点显示名 → 路数
+    const counts = { direct: 0, relay: 0 };
+    const relayNodes = new Map();   // 中继线路名 → 路数
     if (live) for (const pc of peers.values()) {
-      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) continue;
-      const type = pc.connectionState === 'connected' ? (pc.__connectionType || 'unknown') : 'unknown';
+      /* 只统计已经连上的：连不上的不计入，避免出现「检测中」这种悬着的状态 */
+      if (pc.connectionState !== 'connected') continue;
+      const type = pc.__connectionType === 'relay' ? 'relay' : 'direct';
       counts[type] += 1;
       if (type === 'relay' && pc.__relayNode) {
         relayNodes.set(pc.__relayNode, (relayNodes.get(pc.__relayNode) || 0) + 1);
@@ -959,7 +960,7 @@
     if (relayNodes.size) {
       relayPart += `（${[...relayNodes].map(([k, v]) => `${k} ${v}`).join(' / ')}）`;
     }
-    const text = `P2P ${counts.direct}路 / ${relayPart} / 检测中${counts.unknown}路`;
+    const text = `P2P ${counts.direct}路 / ${relayPart}`;
     if (el.stConnections.textContent !== text) el.stConnections.textContent = text;
   }
 
@@ -1240,74 +1241,71 @@
 
   /* ================= 中继线路 ================= */
 
-  /* 服务端默认只下发一条中继（TURN_ONLY），主播这边可以临时换一条：
-     选择记在本机 localStorage，重连时以 turn= 参数告诉服务端。
-     换线路要重建所有 peer —— ICE 配置只在新建 RTCPeerConnection 时读取。 */
+  /* 线路由服务端下发（P2P / 各 TURN 入口），主播这边选哪条就只推哪条。
+     选择记在本机 localStorage，重连时以 turn=<线路 id> 告诉服务端。 */
   const TURN_KEY = 'luma.turn';
-  let turnScope = readTurnPref();
+  let turnLine = readTurnPref();
 
   function readTurnPref() {
     try {
-      return localStorage.getItem(TURN_KEY) || 'auto';
+      return localStorage.getItem(TURN_KEY) || '';
     } catch (err) {
-      return 'auto';
+      return '';
     }
   }
 
   function writeTurnPref(v) {
     try {
-      if (!v || v === 'auto') localStorage.removeItem(TURN_KEY);
+      if (!v || v === 'p2p') localStorage.removeItem(TURN_KEY);
       else localStorage.setItem(TURN_KEY, v);
-    } catch (err) { /* 隐私模式下写不进去，当次有效即可 */ }
-  }
-
-  function turnOptions() {
-    const list = (ICE.nodes || []).map((n) => n && (n.label || n.host)).filter(Boolean);
-    return Array.from(new Set(list));
+    } catch (err) { /* 隐私模式写不进去，当次有效即可 */ }
   }
 
   function paintTurnPick() {
     if (!el.turnPick) return;
-    const opts = turnOptions();
-    if (opts.length < 2) {
+    const lines = ICE.lines || [];
+    if (lines.length < 2) {
       el.turnPick.hidden = true;
       return;
     }
     el.turnPick.hidden = false;
-    const actual = ICE.scope || 'all';
-    const text = actual === 'all' ? '线路 自动' : `线路 ${actual}`;
-    if (el.turnPick.textContent !== text) el.turnPick.textContent = text;
-    el.turnPick.dataset.turn = actual;
-    el.turnPick.title = `当前中继线路：${actual === 'all' ? '全部节点自动选择' : actual}`
-      + `；点击切换（${opts.join(' / ')} / 自动）`;
-  }
 
-  function syncTurnScope(ice) {
-    if (!ice) return;
-    const actual = ice.scope || 'all';
-    if (turnScope !== 'auto' && turnScope !== actual) {
-      turnScope = actual === 'all' ? 'auto' : actual;
-      writeTurnPref(turnScope);
+    const sig = lines.map((l) => `${l.id}:${l.title}`).join(',');
+    if (el.turnPick.dataset.built !== sig) {
+      el.turnPick.textContent = '';
+      lines.forEach((l) => {
+        const opt = document.createElement('option');
+        opt.value = l.id;
+        opt.textContent = l.title || l.id;
+        el.turnPick.appendChild(opt);
+      });
+      el.turnPick.dataset.built = sig;
     }
+
+    const want = ICE.line || 'p2p';
+    if (el.turnPick.value !== want) el.turnPick.value = want;
+    el.turnPick.dataset.line = want;
+    el.turnPick.title = `当前线路：${(lines.find((l) => l.id === want) || {}).title || want}`;
   }
 
-  function switchTurn() {
-    /* 候选：上海 → 香港 → 自动（全部节点还给浏览器自己挑）→ 上海 …
-       当前值取服务端实际生效的线路，所以第一次点一定是「切到另一条真实的线」。 */
-    const seq = turnOptions().concat(['all']);
-    const cur = ICE.scope || 'all';
-    const i = seq.indexOf(cur);
-    turnScope = seq[(i + 1) % seq.length] || 'all';
-    writeTurnPref(turnScope);
-    ICE.scope = turnScope;   // 立刻反映到按钮上，不用等服务端回包
+  function syncTurnLine(ice) {
+    if (!ice) return;
+    const actual = ice.line || 'p2p';
+    turnLine = actual;
+    if (readTurnPref() && readTurnPref() !== actual) writeTurnPref(actual);
+  }
+
+  function switchLine(id) {
+    turnLine = id;
+    writeTurnPref(id);
     paintTurnPick();
+    /* 换线路要重建全部 peer：ICE 配置只在新建 RTCPeerConnection 时读取 */
     closeAllPeers();
     connect(false);
   }
 
   if (el.turnPick) {
-    el.turnPick.addEventListener('click', switchTurn);
-    paintTurnPick();
+    el.turnPick.addEventListener('change', () => switchLine(el.turnPick.value));
   }
 
   /* ================= 事件流 ================= */
@@ -1347,7 +1345,7 @@
     /* TODO(安全)：EventSource 不能带 body，口令只能留在 query 里，会进反代访问日志。
        等接上「/api/auth 换短期 token → SSE 带 token」后改成 token。 */
     const tk = takeover ? '&takeover=1' : '';
-    const turnQ = turnScope && turnScope !== 'auto' ? `&turn=${encodeURIComponent(turnScope)}` : '';
+    const turnQ = turnLine ? `&turn=${encodeURIComponent(turnLine)}` : '';
     es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}${tk}${turnQ}`);
 
     /* 服务端切断这条连接之前会先发这一帧：说明不是网络抖动，是被接管了 */
@@ -1356,7 +1354,7 @@
     es.addEventListener('welcome', (e) => {
       const data = JSON.parse(e.data);
       applyIce(data.ice);
-      syncTurnScope(data.ice);
+      syncTurnLine(data.ice);
       paintTurnPick();
       if (data.title) el.title.value = data.title;
       if (data.startedAt) startedAt = data.startedAt;
