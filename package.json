@@ -1,0 +1,13 @@
+{
+  "name": "luma-live",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-to-browser live streaming + chat, in the spirit of Owncast",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

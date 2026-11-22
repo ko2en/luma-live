@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>LUMA · 开播控制台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%237c3aed'/%3E%3Crect x='11' y='11' width='10' height='10' rx='2' fill='%2308080b'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/styles.css?v=6" />
+</head>
+<body>
+<div class="ambient"></div>
+
+<header class="topbar">
+  <a class="brand" href="/" aria-label="LUMA 首页">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><rect x="4" y="13" width="3.4" height="7" rx="1.2" opacity=".55"/><rect x="10.3" y="8.5" width="3.4" height="11.5" rx="1.2" opacity=".82"/><rect x="16.6" y="4" width="3.4" height="16" rx="1.2"/></svg>
+    </span>
+    <span class="brand-word">LUMA</span>
+  </a>
+  <div class="topbar-mid">
+    <span class="live-pill is-off" data-live-badge><i></i>STANDBY</span>
+    <span class="topbar-title">开播控制台</span>
+  </div>
+  <div class="topbar-right">
+    <span class="stat">
+      <span class="stat-num" data-viewers>0</span>
+      <span class="stat-label">在看</span>
+    </span>
+    <a class="ghost-btn" href="/" target="_blank" rel="noopener">
+      观看页
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M7 17 17 7M9 7h8v8"/></svg>
+    </a>
+  </div>
+</header>
+
+<main class="studio">
+  <div class="studio-main">
+    <div class="preview-wrap" data-preview-wrap>
+      <video data-preview playsinline autoplay muted></video>
+
+      <div class="preview-empty" data-preview-empty>
+        <div class="signal-bars"><span></span><span></span><span></span><span></span><span></span></div>
+        <strong data-empty-title>等待画面</strong>
+        <span data-empty-sub>允许浏览器访问摄像头后，这里会出现你的预览。也可以直接用「共享屏幕」开播。</span>
+        <div class="preview-actions">
+          <button class="solid-btn" data-open-tab type="button" hidden>在新标签页打开</button>
+          <button class="line-btn" data-retry-cam type="button" hidden>重试授权</button>
+        </div>
+      </div>
+
+      <div class="preview-bar">
+        <button class="pill-btn" data-btn-cam type="button">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 10.5 20 7v10l-5-3.5"/><rect x="3" y="6" width="12" height="12" rx="3"/></svg>
+          <span class="label">摄像头</span><i class="dot" data-dot-cam></i>
+        </button>
+
+        <button class="pill-btn" data-btn-mic type="button">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+          <span class="label">麦克风</span><i class="dot" data-dot-mic></i>
+        </button>
+
+        <button class="pill-btn" data-btn-share type="button">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+          <span class="label">共享屏幕</span>
+        </button>
+
+        <span class="rec-dot" data-rec hidden><i></i>ON AIR</span>
+      </div>
+    </div>
+
+    <div class="control-card">
+      <label class="field-label" for="stream-title">本场标题</label>
+      <input id="stream-title" class="title-input" data-title-input maxlength="90"
+             value="在代码与夜色之间 · 独立开发的第 100 天" />
+
+      <div class="media-grid">
+        <label class="media-field">
+          <span class="field-label">麦克风来源</span>
+          <span class="select-wrap">
+            <select class="select" data-mic-select aria-label="选择麦克风"></select>
+            <svg class="select-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>
+          </span>
+        </label>
+
+        <div class="media-field">
+          <span class="field-label">输入电平</span>
+          <div class="vu-row">
+            <div class="vu" data-vu aria-hidden="true">
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            </div>
+            <span class="vu-state" data-vu-state>等待麦克风</span>
+          </div>
+        </div>
+      </div>
+
+      <p class="media-note" data-media-note hidden></p>
+
+      <div class="action-row">
+        <button class="go-live-btn" data-go-live type="button" disabled>准备中…</button>
+      </div>
+
+      <div class="status-note">
+        <span class="bullet"></span>
+        <span data-hint>先说清楚：这是点对点直连，没有中心服务器转码。主播上行带宽 = 每位观众一份，适合几十人以内的自留地直播。</span>
+      </div>
+    </div>
+  </div>
+
+  <aside class="studio-side">
+    <div class="side-card">
+      <h3>直播状态</h3>
+      <div class="kv"><span class="k">状态</span><span class="v" data-st-status>未开播</span></div>
+      <div class="kv"><span class="k">同时在看</span><span class="v" data-st-viewers>0</span></div>
+      <div class="kv"><span class="k">本场时长</span><span class="v" data-st-time>00:00:00</span></div>
+      <div class="kv"><span class="k">画面</span><span class="v" data-st-res>—</span></div>
+      <div class="kv"><span class="k">声音</span><span class="v" data-st-audio>无</span></div>
+      <div class="kv"><span class="k">上行码率</span><span class="v" data-st-bitrate>—</span></div>
+    </div>
+
+    <div class="side-card">
+      <h3>分享给观众</h3>
+      <div class="share-link">
+        <input data-share-url readonly value="/" />
+        <button class="copy-btn" data-copy type="button">复制</button>
+      </div>
+      <p style="margin:12px 0 0;font-size:12px;color:var(--faint);line-height:1.7;">
+        观众打开链接即可观看，无需安装任何东西。手机浏览器同样支持。
+      </p>
+    </div>
+
+    <div class="side-card">
+      <h3>开播须知</h3>
+      <ul class="tips">
+        <li>首次开播浏览器会分别询问摄像头和麦克风权限，都要选「允许」。</li>
+        <li>麦克风没反应：看下方电平表有没有跳动；不动就换一个「麦克风来源」，或点地址栏图标恢复权限。</li>
+        <li>要共享电脑里播放的声音，共享时选「标签页」并勾选「分享标签页音频」。</li>
+        <li>掉线后重新开播，观众端会自动重新接入。</li>
+        <li>关闭此页面即结束本场直播。</li>
+      </ul>
+    </div>
+  </aside>
+</main>
+
+<div class="toast" data-toast></div>
+<script src="/studio.js?v=6"></script>
+</body>
+</html>
