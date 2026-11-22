@@ -10,7 +10,8 @@
       { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
       { urls: 'stun:global.stun.twilio.com:3478' }
     ],
-    nodes: []   /* 服务端下发的节点清单，只用来标注这一路走的是哪条中继 */
+    nodes: [],  /* 服务端下发的节点清单，用来标注线路与提供切换选项 */
+    scope: 'all' /* 服务端本次实际下发的线路：'all' 或某个节点名 */
   };
 
   function applyIce(cfg) {
@@ -19,6 +20,8 @@
     if (!Array.isArray(list) || !list.length) return;
     ICE.iceServers = list;
     ICE.nodes = !Array.isArray(cfg) && Array.isArray(cfg.nodes) ? cfg.nodes : [];
+    /* scope 是服务端算出来的「本次实际生效的线路」，用来画切换按钮的当前值 */
+    ICE.scope = !Array.isArray(cfg) && typeof cfg.scope === 'string' && cfg.scope ? cfg.scope : 'all';
   }
 
   /* 中继 IP → 节点显示名 */
@@ -65,6 +68,7 @@
     keyState: $('[data-key-state]'),
     taken: $('[data-taken-over]'),
     takeOverBtn: $('[data-take-over]'),
+    turnPick: $('[data-turn-pick]'),
     toast: $('[data-toast]')
   };
 
@@ -1234,6 +1238,78 @@
     }
   }
 
+  /* ================= 中继线路 ================= */
+
+  /* 服务端默认只下发一条中继（TURN_ONLY），主播这边可以临时换一条：
+     选择记在本机 localStorage，重连时以 turn= 参数告诉服务端。
+     换线路要重建所有 peer —— ICE 配置只在新建 RTCPeerConnection 时读取。 */
+  const TURN_KEY = 'luma.turn';
+  let turnScope = readTurnPref();
+
+  function readTurnPref() {
+    try {
+      return localStorage.getItem(TURN_KEY) || 'auto';
+    } catch (err) {
+      return 'auto';
+    }
+  }
+
+  function writeTurnPref(v) {
+    try {
+      if (!v || v === 'auto') localStorage.removeItem(TURN_KEY);
+      else localStorage.setItem(TURN_KEY, v);
+    } catch (err) { /* 隐私模式下写不进去，当次有效即可 */ }
+  }
+
+  function turnOptions() {
+    const list = (ICE.nodes || []).map((n) => n && (n.label || n.host)).filter(Boolean);
+    return Array.from(new Set(list));
+  }
+
+  function paintTurnPick() {
+    if (!el.turnPick) return;
+    const opts = turnOptions();
+    if (opts.length < 2) {
+      el.turnPick.hidden = true;
+      return;
+    }
+    el.turnPick.hidden = false;
+    const actual = ICE.scope || 'all';
+    const text = actual === 'all' ? '线路 自动' : `线路 ${actual}`;
+    if (el.turnPick.textContent !== text) el.turnPick.textContent = text;
+    el.turnPick.dataset.turn = actual;
+    el.turnPick.title = `当前中继线路：${actual === 'all' ? '全部节点自动选择' : actual}`
+      + `；点击切换（${opts.join(' / ')} / 自动）`;
+  }
+
+  function syncTurnScope(ice) {
+    if (!ice) return;
+    const actual = ice.scope || 'all';
+    if (turnScope !== 'auto' && turnScope !== actual) {
+      turnScope = actual === 'all' ? 'auto' : actual;
+      writeTurnPref(turnScope);
+    }
+  }
+
+  function switchTurn() {
+    /* 候选：上海 → 香港 → 自动（全部节点还给浏览器自己挑）→ 上海 …
+       当前值取服务端实际生效的线路，所以第一次点一定是「切到另一条真实的线」。 */
+    const seq = turnOptions().concat(['all']);
+    const cur = ICE.scope || 'all';
+    const i = seq.indexOf(cur);
+    turnScope = seq[(i + 1) % seq.length] || 'all';
+    writeTurnPref(turnScope);
+    ICE.scope = turnScope;   // 立刻反映到按钮上，不用等服务端回包
+    paintTurnPick();
+    closeAllPeers();
+    connect(false);
+  }
+
+  if (el.turnPick) {
+    el.turnPick.addEventListener('click', switchTurn);
+    paintTurnPick();
+  }
+
   /* ================= 事件流 ================= */
 
   let reconnectTimer = null;
@@ -1271,7 +1347,8 @@
     /* TODO(安全)：EventSource 不能带 body，口令只能留在 query 里，会进反代访问日志。
        等接上「/api/auth 换短期 token → SSE 带 token」后改成 token。 */
     const tk = takeover ? '&takeover=1' : '';
-    es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}${tk}`);
+    const turnQ = turnScope && turnScope !== 'auto' ? `&turn=${encodeURIComponent(turnScope)}` : '';
+    es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}${tk}${turnQ}`);
 
     /* 服务端切断这条连接之前会先发这一帧：说明不是网络抖动，是被接管了 */
     es.addEventListener('host-taken', () => handleHostTaken());
@@ -1279,6 +1356,8 @@
     es.addEventListener('welcome', (e) => {
       const data = JSON.parse(e.data);
       applyIce(data.ice);
+      syncTurnScope(data.ice);
+      paintTurnPick();
       if (data.title) el.title.value = data.title;
       if (data.startedAt) startedAt = data.startedAt;
       if (keyRequired) setKeyState('口令正确', 'ok');

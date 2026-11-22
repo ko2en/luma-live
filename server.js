@@ -70,6 +70,13 @@ const TURN_EXTRA = String(process.env.TURN_EXTRA || '')
 const TURN_PREFER = String(process.env.TURN_PREFER || '').trim();
 const TURN_LABEL = String(process.env.TURN_LABEL || '').trim();
 
+/* 强制线路：TURN_ONLY 只把这一个节点下发给客户端，其余节点不参与协商。
+   取值：host / kind（main|extra）/ 显示名；填 all 或留空 = 不过滤（旧行为）。
+   场景：内地观众明明该走内地中继，却因为香港那条候选先连通而绕出国再回来，
+   所以默认只给最近的那条。有人网络到那条不通时，页面上的「线路」按钮
+   （或 ?turn=<host|label|all>）可以当场切回其它节点，不必改服务器配置。 */
+const TURN_ONLY = String(process.env.TURN_ONLY || '').trim();
+
 /* 默认 STUN：不配 TURN 时就是这一份，行为和以前完全一致 */
 const DEFAULT_STUN = [
   'stun:stun.l.google.com:19302',
@@ -251,7 +258,17 @@ function turnEntry(host, port, secret, tlsPort) {
   return entry;
 }
 
-function iceNodes() {
+/* 节点匹配：host / kind / 显示名都认，大小写不敏感 */
+function matchNode(node, want) {
+  const w = String(want || '').trim().toLowerCase();
+  if (!w) return false;
+  return node.host.toLowerCase() === w
+    || node.kind === w
+    || String(node.label || '').toLowerCase() === w;
+}
+
+/* 全部可用节点（已按 TURN_PREFER 排好序） */
+function allNodes() {
   const nodes = [];
   if (TURN_HOST) {
     nodes.push({
@@ -276,8 +293,31 @@ function iceNodes() {
   return nodes;
 }
 
-function icePayload() {
-  const nodes = iceNodes();
+/* 本次连接实际下发的节点。
+   scope 来自 URL 的 turn 参数：auto（默认，按 TURN_ONLY）/ all / host|kind|label。
+   手动指定优先于服务器上的强制设置；指定的节点不存在时退回默认，不至于连不上。 */
+function iceNodes(scope) {
+  const nodes = allNodes();
+  if (nodes.length <= 1) return nodes;
+
+  const want = String(scope || '').trim().toLowerCase();
+  if (want === 'all') return nodes;
+  if (want && want !== 'auto') {
+    const picked = nodes.filter((n) => matchNode(n, want));
+    if (picked.length) return picked;
+  }
+
+  const forced = TURN_ONLY.toLowerCase();
+  if (forced && forced !== 'all') {
+    const picked = nodes.filter((n) => matchNode(n, forced));
+    if (picked.length) return picked;
+  }
+  return nodes;
+}
+
+function icePayload(scope) {
+  const all = allNodes();
+  const nodes = iceNodes(scope);
   const servers = [{ urls: DEFAULT_STUN.slice() }];
 
   for (const node of nodes) {
@@ -285,12 +325,20 @@ function icePayload() {
     servers.push(turnEntry(node.host, node.port, node.secret, node.tls));
   }
 
+  const active = nodes.map((n) => n.host);
   return {
     iceServers: servers,
     ttl: TURN_TTL_SEC,
-    /* nodes / preferred 只用于前端显示「这一路走的是哪个节点」，不参与协商 */
-    nodes: nodes.map((n) => ({ host: n.host, port: n.port, label: n.label, kind: n.kind })),
-    preferred: nodes.length ? nodes[0].host : ''
+    /* nodes 给的是全部节点（含 active 标记），前端据此画「线路」切换按钮：
+       只有一条可用时按钮不出现，多于一条时点一下就能换。 */
+    nodes: all.map((n) => ({
+      host: n.host, port: n.port, label: n.label, kind: n.kind,
+      active: active.includes(n.host)
+    })),
+    preferred: nodes.length ? nodes[0].host : '',
+    /* 是否被限制成「只走部分节点」，以及当前生效的是哪条 */
+    forced: active.length > 0 && active.length < all.length,
+    scope: nodes.length && nodes.length === all.length ? 'all' : (nodes[0] ? nodes[0].label : '')
   };
 }
 
@@ -477,6 +525,9 @@ function handleEvents(req, res, url) {
   const id = (url.searchParams.get('id') || '').slice(0, 64);
   const role = url.searchParams.get('role') === 'host' ? 'host' : 'viewer';
   const name = (url.searchParams.get('name') || '访客').slice(0, 24);
+  /* 线路：页面上的「线路」按钮切换后会带 turn=<host|label|all> 重连。
+     不传就是 auto —— 按服务器上的 TURN_ONLY 走默认线路。 */
+  const turn = (url.searchParams.get('turn') || 'auto').slice(0, 32);
 
   if (!id) return json(res, 400, { error: 'missing id' });
   const previous = clients.get(id);
@@ -548,7 +599,7 @@ function handleEvents(req, res, url) {
      EventSource 断线重连会让 welcome 再来一遍，不能只在第一次生效。
      TODO(安全)：EventSource 不支持自定义 POST，host 的口令只能留在 query 里，
      会进反向代理的访问日志。等改为「/api/auth 换短期 token → SSE 带 token」后去掉。 */
-  sendTo(id, 'welcome', { id, role, ice: icePayload(), ...statePayload() });
+  sendTo(id, 'welcome', { id, role, ice: icePayload(turn), ...statePayload() });
   sendTo(id, 'history', chatLog.slice(-80));
   if (role === 'viewer') {
     if (stream.live && stream.hostId && stream.hostId !== id) {
@@ -888,14 +939,25 @@ server.listen(PORT, '0.0.0.0', () => {
     const mark = t.secret ? 'REST 凭证' : '匿名中继';
     console.log(`  TURN 附加 ${t.host}:${t.port} · udp/tcp · ${mark}${t.label ? ` · ${t.label}` : ''}`);
   }
-  const turnOrder = iceNodes();
+  const turnOrder = allNodes();
   if (turnOrder.length > 1) {
     const names = turnOrder.map((n) => `${n.label}(${n.host})`).join(' → ');
-    console.log(`  中继顺序  ${names}`);
-    if (TURN_PREFER) {
-      console.log(`            首选 ${turnOrder[0].label} —— 排在 iceServers 最前，先完成分配的先被选中`);
+    if (TURN_ONLY && TURN_ONLY.toLowerCase() !== 'all') {
+      const only = iceNodes('auto');
+      if (only.length === 1) {
+        console.log(`  中继线路  只用 ${only[0].label}(${only[0].host}) —— 其余节点只在页面上手动切换时才下发`);
+      } else {
+        console.log(`  中继线路  只下发 ${only.map((n) => n.label).join('+')}（TURN_ONLY=${TURN_ONLY}）`);
+      }
+      console.log(`            全部备选  ${names}`);
     } else {
-      console.log('            想让某个节点优先，设 TURN_PREFER=<host|main|extra|label>');
+      console.log(`  中继顺序  ${names}`);
+      if (TURN_PREFER) {
+        console.log(`            首选 ${turnOrder[0].label} —— 排在 iceServers 最前，先完成分配的先被选中`);
+      } else {
+        console.log('            想让某个节点优先，设 TURN_PREFER=<host|main|extra|label>');
+      }
+      console.log('            想让其它节点只在手动切换时出现，设 TURN_ONLY=<host|main|extra|label>');
     }
   }
   if (AUTH_LOCK_MS) console.log(`  口令限速 ${AUTH_MAX_FAILS} 次失败锁 ${AUTH_LOCK_MS / 1000}s${TRUST_PROXY ? '（读 X-Forwarded-For）' : ''}`);

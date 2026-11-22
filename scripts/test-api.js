@@ -371,6 +371,7 @@ async function testTurn() {
     // ---- 9. TURN 下发（另起一台带 TURN_* 的服务） ----
     await testTurn();
     await testTurnPrefer();
+    await testTurnOnly();
 
     // ---- 10. 口令尝试限速（放最后：会把自己锁住） ----
     await req('POST', '/api/auth', { key: KEY }); // 先清零计数
@@ -421,7 +422,7 @@ async function testTurn() {
 /* ------------------------------------------------------------------ *
  * TURN 优先节点：TURN_PREFER 决定 iceServers 里哪个节点排在最前
  * ------------------------------------------------------------------ */
-async function iceOrder(env, port) {
+async function iceOrder(env, port, turn) {
   const srv = spawnServer(Object.assign({
     PORT: String(port),
     STREAM_KEY: '',
@@ -433,7 +434,8 @@ async function iceOrder(env, port) {
   try {
     if (!await srv.ready()) return { ice, boot: srv.boot() };
     boot = srv.boot();
-    const viewer = await sse('role=viewer&id=probe&name=probe', port);
+    const turnQ = turn ? `&turn=${encodeURIComponent(turn)}` : '';
+    const viewer = await sse(`role=viewer&id=probe&name=probe${turnQ}`, port);
     const welcome = await viewer.waitFor('welcome');
     ice = welcome && welcome.data && welcome.data.ice;
     viewer.close();
@@ -496,4 +498,70 @@ async function testTurnPrefer() {
     TURN_PREFER: 'extra'
   }, PORT + 13);
   check('TURN_PREFER=extra 也能生效', firstTurnHost(c.ice) === '203.0.113.20', firstTurnHost(c.ice));
+}
+
+/* ------------------------------------------------------------------ *
+ * 强制线路（TURN_ONLY）：默认只下发一条，其余节点留着手动切换
+ * ------------------------------------------------------------------ */
+function turnHosts(ice) {
+  const hosts = [];
+  for (const s of (ice && ice.iceServers) || []) {
+    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+    for (const u of urls) {
+      const m = /^turns?:([^:?]+)/.exec(String(u) || '');
+      if (m) hosts.push(m[1]);
+    }
+  }
+  /* 每个节点会下发 udp / tcp / tls 多条 url，按 host 去重 */
+  return Array.from(new Set(hosts));
+}
+
+function nodeActive(ice, label) {
+  const hit = ((ice && ice.nodes) || []).find((n) => n.label === label);
+  return hit ? Boolean(hit.active) : null;
+}
+
+async function testTurnOnly() {
+  const sh = '203.0.113.20:23478:sh-secret:sh';
+  const baseEnv = {
+    TURN_HOST: 'hk.example.com',
+    TURN_PORT: '3478',
+    TURN_STATIC_AUTH_SECRET: 'main-secret',
+    TURN_LABEL: 'hk',
+    TURN_EXTRA: sh
+  };
+
+  /* 1. TURN_ONLY=sh：默认只给上海 */
+  const a = await iceOrder(Object.assign({ TURN_ONLY: 'sh' }, baseEnv), PORT + 14);
+  check('TURN_ONLY=sh → iceServers 只有上海',
+    turnHosts(a.ice).join(',') === '203.0.113.20', turnHosts(a.ice).join(','));
+  check('TURN_ONLY=sh → forced 为真且 scope=sh',
+    !!(a.ice && a.ice.forced === true && a.ice.scope === 'sh'),
+    JSON.stringify({ forced: a.ice && a.ice.forced, scope: a.ice && a.ice.scope }));
+  check('香港仍在 nodes 里但未被启用',
+    nodeActive(a.ice, 'hk') === false && nodeActive(a.ice, 'sh') === true,
+    JSON.stringify((a.ice && a.ice.nodes) || []));
+  check('启动日志写明只用上海', (a.boot || '').includes('只用 sh'), (a.boot || '').slice(-240));
+
+  /* 2. 手动切香港 */
+  const b = await iceOrder(Object.assign({ TURN_ONLY: 'sh' }, baseEnv), PORT + 15, 'hk');
+  check('turn=hk → 只下发香港', turnHosts(b.ice).join(',') === 'hk.example.com', turnHosts(b.ice).join(','));
+  check('turn=hk → scope=hk 且 forced', !!(b.ice && b.ice.scope === 'hk' && b.ice.forced === true),
+    JSON.stringify({ scope: b.ice && b.ice.scope, forced: b.ice && b.ice.forced }));
+
+  /* 3. 手动放开全部 */
+  const c = await iceOrder(Object.assign({ TURN_ONLY: 'sh' }, baseEnv), PORT + 16, 'all');
+  check('turn=all → 两个节点都下发', turnHosts(c.ice).length === 2, turnHosts(c.ice).join(','));
+  check('turn=all → forced=false / scope=all',
+    !!(c.ice && c.ice.forced === false && c.ice.scope === 'all'),
+    JSON.stringify({ forced: c.ice && c.ice.forced, scope: c.ice && c.ice.scope }));
+
+  /* 4. 不存在的线路退回默认，不至于连不上 */
+  const d = await iceOrder(Object.assign({ TURN_ONLY: 'sh' }, baseEnv), PORT + 17, 'nope');
+  check('turn=nope → 退回上海', turnHosts(d.ice).join(',') === '203.0.113.20', turnHosts(d.ice).join(','));
+
+  /* 5. 不设 TURN_ONLY → 行为与旧版一致（全量下发） */
+  const e = await iceOrder(baseEnv, PORT + 18);
+  check('不设 TURN_ONLY → 仍是两个节点都下发', turnHosts(e.ice).length === 2, turnHosts(e.ice).join(','));
+  check('不设 TURN_ONLY → forced=false', !!(e.ice && e.ice.forced === false), String(e.ice && e.ice.forced));
 }
