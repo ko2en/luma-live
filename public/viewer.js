@@ -145,9 +145,18 @@
       if (s.live && !wasLive) waiting();
       if (!s.live && wasLive) offline('直播已结束', '主播结束了本场直播，页面会自动等待下一场。');
     }
+    if (typeof s.hostReconnecting === 'boolean') {
+      if (s.hostReconnecting && !reconnectingNoted) {
+        reconnectingNoted = true;
+        toast('主播的网络抖了一下，正在自动重连…');
+      } else if (!s.hostReconnecting) {
+        reconnectingNoted = false;
+      }
+    }
   }
 
   function waiting() {
+    if (hardFail) return;
     el.idleTitle.textContent = '正在接入画面…';
     el.idleSub.textContent = '已建立与主播的点对点连接，稍等一下。';
     el.player.classList.remove('is-playing');
@@ -242,7 +251,7 @@
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: nickname, text, role: 'viewer' })
+        body: JSON.stringify({ name: nickname, text, role: 'viewer', clientId })
       });
       if (res.status === 429) {
         toast('说得太快了，缓一下');
@@ -330,10 +339,18 @@
   let pendingCandidates = [];
   let restartTimer = null;
   let unmuteOffered = false;
+  let everConnected = false;
+  let failStreak = 0;
+  let hardFail = false;
+  let reconnectingNoted = false;
+  let lastInbound = null;   // { bytes, received, lost, at }
+  let stalledCount = 0;
 
   function closePeer() {
     clearTimeout(restartTimer);
     pendingCandidates = [];
+    lastInbound = null;
+    stalledCount = 0;
     if (pc) {
       try {
         pc.ontrack = null;
@@ -352,6 +369,43 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: clientId, to, data })
     }).catch(() => {});
+  }
+
+  /* 打洞失败时说人话，别让人盯着「正在接入画面…」等到放弃 */
+  function showConnectProblem() {
+    el.player.classList.remove('is-playing');
+    el.idleTitle.textContent = '连不上主播的画面';
+    el.idleSub.textContent =
+      '你和主播之间没能建立直连。公司网络、校园网、部分手机热点会在中间做地址转换，导致 P2P 打洞失败。换一个网络（比如手机热点）重新打开本页通常就好了；如果一直不行，需要主播那边部署 TURN 中继。';
+  }
+
+  async function probeIce(peer) {
+    try {
+      const stats = await peer.getStats();
+      let ok = false;
+      stats.forEach((r) => {
+        if (r.type !== 'candidate-pair') return;
+        if (r.state === 'succeeded' || (typeof r.bytesReceived === 'number' && r.bytesReceived > 0)) ok = true;
+      });
+      return ok;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  async function onPeerFailed(peer) {
+    failStreak += 1;
+    const reachable = await probeIce(peer).catch(() => null);
+
+    // 还有可用候选对，或者之前成功过（只是抖动）→ 快速重试
+    if (reachable === true || everConnected || failStreak < 2) {
+      requestRestart();
+      return;
+    }
+
+    hardFail = true;
+    showConnectProblem();
+    requestRestart(20000); // 慢速兜底：换了网络还能自愈
   }
 
   function createPeer() {
@@ -375,6 +429,9 @@
     peer.onconnectionstatechange = () => {
       const s = peer.connectionState;
       if (s === 'connected') {
+        everConnected = true;
+        failStreak = 0;
+        hardFail = false;
         el.player.classList.add('is-playing');
         if (!unmuteOffered) {
           unmuteOffered = true;
@@ -383,20 +440,20 @@
       } else if (s === 'disconnected') {
         toast('画面连接不稳定，正在恢复…');
       } else if (s === 'failed') {
-        requestRestart();
+        onPeerFailed(peer);
       }
     };
 
     return peer;
   }
 
-  function requestRestart() {
+  function requestRestart(delay) {
     if (!hostId) return;
     clearTimeout(restartTimer);
     restartTimer = setTimeout(() => {
       if (!state.live) return;
       postSignal(hostId, { request: 'restart' });
-    }, 1200);
+    }, delay || 1200);
   }
 
   async function handleOffer(from, sdp) {
@@ -496,6 +553,74 @@
       }
     };
   }
+
+  /* ================= 链路质量回报 + 自检 ================= */
+  /* 每 3 秒做两件事：
+     1) 把丢包/RTT 回报给主播，主播按档位单独调这一路的码率；
+     2) 自检「连接状态是 connected，但画面一个字节都不进」的半死连接。 */
+
+  let sampling = false;
+
+  async function sampleLink() {
+    if (sampling || !state.live || !pc || !hostId) return;
+    if (pc.connectionState !== 'connected') return;
+
+    sampling = true;
+    let bytes = 0;
+    let received = 0;
+    let lost = 0;
+    let rtt = 0;
+
+    try {
+      const stats = await pc.getStats();
+      stats.forEach((r) => {
+        if (r.type === 'inbound-rtp' && r.kind === 'video' && typeof r.bytesReceived === 'number') {
+          bytes = r.bytesReceived;
+          received = r.packetsReceived || 0;
+          lost = r.packetsLost || 0;
+        }
+        if (r.type === 'candidate-pair' && r.state === 'succeeded' && typeof r.currentRoundTripTime === 'number') {
+          rtt = Math.max(rtt, r.currentRoundTripTime);
+        }
+      });
+    } catch (err) {
+      sampling = false;
+      return;
+    }
+
+    const now = performance.now();
+    let kbps = 0;
+    let loss = 0;
+
+    if (lastInbound && now > lastInbound.at) {
+      const dt = (now - lastInbound.at) / 1000;
+      kbps = Math.max(0, Math.round(((bytes - lastInbound.bytes) * 8) / dt / 1000));
+
+      const dRecv = Math.max(0, received - lastInbound.received);
+      const dLost = Math.max(0, lost - lastInbound.lost);
+      loss = dRecv + dLost > 0 ? dLost / (dRecv + dLost) : 0;
+
+      if (bytes === lastInbound.bytes) {
+        stalledCount += 1;
+        if (stalledCount >= 3) {
+          stalledCount = 0;
+          toast('画面卡住了，正在重新连接…');
+          requestRestart(500);
+        }
+      } else {
+        stalledCount = 0;
+      }
+    }
+
+    lastInbound = { bytes, received, lost, at: now };
+    sampling = false;
+
+    postSignal(hostId, {
+      stats: { kbps, loss: Number(loss.toFixed(3)), rtt: Math.round(rtt * 1000) }
+    });
+  }
+
+  setInterval(sampleLink, 3000);
 
   /* ================= 分享 ================= */
 

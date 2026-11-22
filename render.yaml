@@ -7,3 +7,9 @@ services:
     startCommand: node server.js
     healthCheckPath: /
     autoDeploy: true
+    envVars:
+      # 部署时 Render 会让你填这个值：开播口令。不填等于裸奔。
+      - key: STREAM_KEY
+        sync: false
+      - key: HOST_GRACE_MS
+        value: "10000"

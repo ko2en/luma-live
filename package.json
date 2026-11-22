@@ -1,11 +1,14 @@
 {
   "name": "luma-live",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Browser-to-browser live streaming + chat, in the spirit of Owncast",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node scripts/test-api.js",
+    "test:studio": "node scripts/test-studio-key.js",
+    "test:e2e": "node scripts/test-e2e.js"
   },
   "engines": {
     "node": ">=18"

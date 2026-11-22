@@ -40,6 +40,9 @@
     stBitrate: $('[data-st-bitrate]'),
     share: $('[data-share-url]'),
     copy: $('[data-copy]'),
+    keyRow: $('[data-key-row]'),
+    keyInput: $('[data-key-input]'),
+    keyState: $('[data-key-state]'),
     toast: $('[data-toast]')
   };
 
@@ -74,6 +77,11 @@
   let lastBytes = null;
   let lastStatAt = 0;
 
+  /* 开播口令：只存本机，永远不放进分享链接（否则观众都能开播） */
+  let streamKey = (localStorage.getItem('luma:key') || '').trim();
+  let keyRequired = false;
+  let es = null;
+
   function toast(text) {
     el.toast.textContent = text;
     el.toast.classList.add('show');
@@ -87,6 +95,17 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
+  }
+
+  function postStream(body) {
+    return post('/api/stream', { id: hostId, key: streamKey, ...body });
+  }
+
+  function setKeyState(text, kind) {
+    if (!el.keyState) return;
+    el.keyState.textContent = text || '';
+    if (kind) el.keyState.dataset.state = kind;
+    else delete el.keyState.dataset.state;
   }
 
   /* ================= 媒体 ================= */
@@ -592,8 +611,24 @@
   }
 
   async function renegotiate(viewerId, pc) {
+    /* 正在协商中就直接发 offer 会抛 InvalidStateError，且这一路观众
+       从此永远缺一条轨。这里挂一个待办标记，等回到 stable 再补一次。 */
+    if (pc.signalingState !== 'stable') {
+      pc.__pendingOffer = true;
+      if (!pc.__pendingHooked) {
+        pc.__pendingHooked = true;
+        pc.addEventListener('signalingstatechange', () => {
+          if (pc.signalingState === 'stable' && pc.__pendingOffer) {
+            pc.__pendingOffer = false;
+            renegotiate(viewerId, pc);
+          }
+        });
+      }
+      return;
+    }
+
     try {
-      if (pc.signalingState !== 'stable') return;
+      pc.__pendingOffer = false;
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       postSignal(viewerId, { sdp: pc.localDescription });
@@ -748,8 +783,7 @@
 
   function syncMuted() {
     if (!live) return;
-    post('/api/stream', {
-      id: hostId,
+    postStream({
       muted: { audio: !(micOn && micStream) && !screenAudioOn, video: !camOn && !usingScreen }
     }).catch(() => {});
   }
@@ -769,6 +803,17 @@
   }
 
   el.goLive.addEventListener('click', async () => {
+    if (keyRequired && !streamKey) {
+      const typed = el.keyInput ? el.keyInput.value.trim() : '';
+      const ok = typed ? await useKey(typed) : false;
+      if (!ok) {
+        toast(typed ? '开播口令不对' : '先填开播口令才能开播');
+        if (el.keyInput) el.keyInput.focus();
+        return;
+      }
+      connect();
+    }
+
     if (!hasVideo() && !micStream) {
       el.goLive.disabled = true;
       el.goLive.textContent = '请求设备…';
@@ -788,14 +833,20 @@
 
     try {
       if (!live) {
-        const res = await post('/api/stream', {
-          id: hostId,
+        const res = await postStream({
           live: true,
           title: el.title.value.trim(),
           muted: { audio: !(micOn && micStream) && !screenAudioOn, video: !camOn && !usingScreen }
         });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
+          if (res.status === 401) {
+            streamKey = '';
+            localStorage.removeItem('luma:key');
+            if (el.keyRow) el.keyRow.hidden = false;
+            setKeyState('口令不对', 'bad');
+            if (el.keyInput) el.keyInput.focus();
+          }
           toast(data.error || '开播失败');
           el.goLive.disabled = false;
           return;
@@ -804,7 +855,7 @@
         paintLiveState();
         toast('已开播，把观看链接发给观众吧');
       } else {
-        await post('/api/stream', { id: hostId, live: false });
+        await postStream({ live: false });
         live = false;
         startedAt = null;
         closeAllPeers();
@@ -824,7 +875,7 @@
     clearTimeout(titleTimer);
     titleTimer = setTimeout(() => {
       if (!live) return;
-      post('/api/stream', { id: hostId, title: el.title.value.trim() }).catch(() => {});
+      postStream({ title: el.title.value.trim() }).catch(() => {});
     }, 400);
   });
 
@@ -851,12 +902,52 @@
     el.stBitrate.textContent = '—';
   }
 
-  function tuneSender(sender) {
+  /* 每个观众一条独立 RTCPeerConnection，天然可以单独设档。
+     观众端每 3 秒回报一次丢包/RTT，这里据此调该观众的码率上限。 */
+  const TIER_BITRATE = { high: 2500000, mid: 1200000, low: 600000 };
+  const TIER_RANK = { low: 0, mid: 1, high: 2 };
+
+  function tierFor(stats) {
+    const loss = Number(stats && stats.loss) || 0;
+    const rtt = Number(stats && stats.rtt) || 0;
+    if (loss > 0.08 || rtt > 500) return 'low';
+    if (loss > 0.03 || rtt > 250) return 'mid';
+    return 'high';
+  }
+
+  function applyViewerStats(viewerId, stats) {
+    const pc = peers.get(viewerId);
+    if (!pc) return;
+    pc.__lastStatsAt = Date.now();
+
+    const want = tierFor(stats);
+    const cur = pc.__tier || 'high';
+    if (want === cur) {
+      pc.__goodStreak = 0;
+      return;
+    }
+
+    // 掉档立刻生效；升档要连续三次稳定，避免在边界来回抖
+    if (TIER_RANK[want] < TIER_RANK[cur]) {
+      pc.__tier = want;
+      pc.__goodStreak = 0;
+      tunePeer(pc);
+    } else {
+      pc.__goodStreak = (pc.__goodStreak || 0) + 1;
+      if (pc.__goodStreak >= 3) {
+        pc.__tier = want;
+        pc.__goodStreak = 0;
+        tunePeer(pc);
+      }
+    }
+  }
+
+  function tuneSender(sender, maxBitrate) {
     try {
       const params = sender.getParameters();
       if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-      params.encodings[0].maxBitrate = 2500000;
-      params.degradationPreference = 'maintain-resolution';
+      params.encodings[0].maxBitrate = maxBitrate || TIER_BITRATE.high;
+      params.degradationPreference = maxBitrate && maxBitrate < 1000000 ? 'balanced' : 'maintain-resolution';
       return sender.setParameters(params).catch(() => {});
     } catch (err) {
       return Promise.resolve();
@@ -864,8 +955,9 @@
   }
 
   function tunePeer(pc) {
+    const max = TIER_BITRATE[pc.__tier || 'high'];
     pc.getSenders().forEach((s) => {
-      if (s.track && s.track.kind === 'video') tuneSender(s);
+      if (s.track && s.track.kind === 'video') tuneSender(s, max);
     });
   }
 
@@ -874,6 +966,8 @@
     closePeer(viewerId);
 
     const pc = new RTCPeerConnection(ICE);
+    pc.__tier = 'high';
+    pc.__lastStatsAt = Date.now();
     peers.set(viewerId, pc);
 
     localStream.getTracks().forEach((track) => {
@@ -906,20 +1000,28 @@
 
   /* ================= 事件流 ================= */
 
-  let es = null;
+  let reconnectTimer = null;
 
   function connect() {
-    es = new EventSource(`/api/events?role=host&id=${encodeURIComponent(hostId)}&name=Luma`);
+    clearTimeout(reconnectTimer);
+    if (es) {
+      try { es.close(); } catch (err) { /* noop */ }
+      es = null;
+    }
+
+    const q = `role=host&id=${encodeURIComponent(hostId)}&name=Luma`;
+    es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}`);
 
     es.addEventListener('welcome', (e) => {
       const data = JSON.parse(e.data);
       if (data.title) el.title.value = data.title;
       if (data.startedAt) startedAt = data.startedAt;
+      if (keyRequired) setKeyState('口令正确', 'ok');
       if (data.live) {
         live = true;
         paintLiveState();
         // 断线重连后主动重建所有连接
-        post('/api/stream', { id: hostId, live: true, title: el.title.value.trim() }).catch(() => {});
+        postStream({ live: true, title: el.title.value.trim() }).catch(() => {});
       } else {
         paintLiveState();
       }
@@ -974,6 +1076,12 @@
         return;
       }
 
+      // 观众回报的链路质量：只调这一路观众的码率，不影响别人
+      if (data.stats) {
+        applyViewerStats(from, data.stats);
+        return;
+      }
+
       const pc = peers.get(from);
       if (!pc) return;
 
@@ -986,10 +1094,32 @@
       } catch (err) { /* 单个观众协商失败不影响其他人 */ }
     });
 
-    es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED) {
-        setTimeout(connect, 2500);
+    es.addEventListener('notice', (e) => {
+      let data = {};
+      try { data = JSON.parse(e.data); } catch (err) { /* noop */ }
+      if (data && data.text) toast(data.text);
+    });
+
+    es.onerror = async () => {
+      if (es.readyState !== EventSource.CLOSED) return;
+
+      /* 口令错时 EventSource 不会自动重连，这里先分辨是「口令错」还是「网络断」，
+         否则就会每 2.5 秒拿错口令去撞一次 401。 */
+      if (keyRequired) {
+        try {
+          const r = await fetch(`/api/auth?key=${encodeURIComponent(streamKey)}`);
+          if (r.status === 401) {
+            setKeyState('口令不对', 'bad');
+            if (el.keyRow) el.keyRow.hidden = false;
+            if (el.keyInput) el.keyInput.focus();
+            toast('开播口令不对，已暂停重连');
+            return;
+          }
+        } catch (err) { /* 网络问题，照常重试 */ }
       }
+
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 2500);
     };
   }
 
@@ -1027,7 +1157,9 @@
     const now = performance.now();
     if (lastBytes !== null && now > lastStatAt) {
       const kbps = Math.round(((bytes - lastBytes) * 8) / ((now - lastStatAt) / 1000) / 1000);
-      el.stBitrate.textContent = `${kbps} kbps · ${peers.size} 路`;
+      let degraded = 0;
+      for (const pc of peers.values()) if (pc.__tier && pc.__tier !== 'high') degraded += 1;
+      el.stBitrate.textContent = `${kbps} kbps · ${peers.size} 路${degraded ? ` · ${degraded} 路降档` : ''}`;
     }
     lastBytes = bytes;
     lastStatAt = now;
@@ -1050,12 +1182,77 @@
 
   /* ================= 启动 ================= */
 
-  el.goLive.textContent = '开始直播';
-  ensureAudioGraph();
-  resumeAudio();
-  refreshMicList();
-  paintMediaState();
-  ensureMedia();
-  paintLiveState();
-  connect();
+  /* 校验并记住口令。成功返回 true。 */
+  async function useKey(value) {
+    const v = String(value || '').trim();
+    if (!v) return false;
+    setKeyState('校验中…');
+    try {
+      const r = await fetch(`/api/auth?key=${encodeURIComponent(v)}`);
+      if (!r.ok) {
+        setKeyState('口令不对', 'bad');
+        return false;
+      }
+    } catch (err) {
+      setKeyState('网络异常', 'bad');
+      return false;
+    }
+    streamKey = v;
+    try { localStorage.setItem('luma:key', v); } catch (err) { /* 隐私模式下可能禁用 */ }
+    setKeyState('口令正确', 'ok');
+    return true;
+  }
+
+  if (el.keyInput) {
+    el.keyInput.addEventListener('keydown', async (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      if (await useKey(el.keyInput.value)) {
+        toast('口令已保存，开播通道已连接');
+        connect();
+      }
+    });
+  }
+
+  async function boot() {
+    el.goLive.textContent = '开始直播';
+    ensureAudioGraph();
+    resumeAudio();
+    refreshMicList();
+    paintMediaState();
+    paintLiveState();
+
+    try {
+      const cfg = await fetch('/api/config').then((r) => r.json());
+      keyRequired = Boolean(cfg && cfg.requireKey);
+    } catch (err) {
+      keyRequired = false;
+    }
+
+    if (keyRequired) {
+      if (el.keyRow) el.keyRow.hidden = false;
+      if (el.keyInput) el.keyInput.value = streamKey;
+
+      if (!streamKey) {
+        setKeyState('需要口令', 'bad');
+        ensureMedia();
+        if (el.keyInput) el.keyInput.focus();
+        return; // 没口令不连 SSE：host 身份是要凭口令占的
+      }
+
+      const ok = await useKey(streamKey);
+      if (!ok) {
+        streamKey = '';
+        try { localStorage.removeItem('luma:key'); } catch (err) { /* noop */ }
+        ensureMedia();
+        if (el.keyInput) el.keyInput.focus();
+        return;
+      }
+    }
+
+    ensureMedia();
+    connect();
+  }
+
+  boot();
 })();

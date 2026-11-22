@@ -9,9 +9,21 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_DIR = path.join(__dirname, 'public');
+
+/* 开播口令：设了就必须带对才能占住 host 身份。
+   不设则任何人打开 /studio 都能开播（只适合本机/内网自用）。 */
+const STREAM_KEY = String(process.env.STREAM_KEY || '').trim();
+
+/* 主播 SSE 掉线后的宽限期：媒体是 P2P 直连，SSE 断了画面还在，
+   只要主播在宽限期内重连回来，这场直播就不该被判死。 */
+const HOST_GRACE_MS = Math.max(0, Number(process.env.HOST_GRACE_MS || 10000));
+
+const CHAT_MIN_INTERVAL = Math.max(0, Number(process.env.CHAT_MIN_INTERVAL || 350));
+const CHAT_RATE_MAP_MAX = 1000;
 
 /* ------------------------------------------------------------------ *
  * 内存状态（直播间是实时的，重启即清空，符合直播语义）
@@ -25,6 +37,7 @@ const PALETTE = [
 const clients = new Map(); // id -> { id, role, res, name, joinedAt }
 const chatLog = [];        // 最近 120 条
 let chatSeq = 0;
+/* 限速键是「连接」，不是昵称：换昵称绕不过去，连接断开后由宽限期清扫 */
 const lastChatAt = new Map();
 
 const stream = {
@@ -36,6 +49,10 @@ const stream = {
   startedAt: null,
   hostId: null
 };
+
+/* host 断线宽限期的运行态 */
+let hostGraceTimer = null;
+let hostGraceUntil = 0;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -59,6 +76,47 @@ function colorFor(name) {
   return PALETTE[h % PALETTE.length];
 }
 
+/* 定时比较，避免逐字符短路泄漏口令长度/前缀 */
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a), 'utf8');
+  const y = Buffer.from(String(b), 'utf8');
+  if (x.length !== y.length) return false;
+  try { return crypto.timingSafeEqual(x, y); } catch (err) { return false; }
+}
+
+function keyOk(candidate) {
+  if (!STREAM_KEY) return true;
+  return safeEqual(candidate, STREAM_KEY);
+}
+
+function clearHostGrace() {
+  if (hostGraceTimer) {
+    clearTimeout(hostGraceTimer);
+    hostGraceTimer = null;
+  }
+  hostGraceUntil = 0;
+}
+
+/* 主播掉线：先不判死，给 10 秒重连窗口 */
+function startHostGrace() {
+  clearHostGrace();
+  if (!HOST_GRACE_MS) return;
+  hostGraceUntil = Date.now() + HOST_GRACE_MS;
+  hostGraceTimer = setTimeout(() => {
+    hostGraceTimer = null;
+    hostGraceUntil = 0;
+    if (stream.hostId || !stream.live) {
+      broadcastState(true);
+      return;
+    }
+    stream.live = false;
+    stream.startedAt = null;
+    broadcast('stream-ended', { reason: 'host-disconnected' });
+    broadcastState(true);
+  }, HOST_GRACE_MS);
+  if (hostGraceTimer.unref) hostGraceTimer.unref();
+}
+
 function viewerCount() {
   let n = 0;
   for (const c of clients.values()) if (c.role === 'viewer') n++;
@@ -80,7 +138,9 @@ function statePayload() {
     muted: stream.muted,
     startedAt: stream.startedAt,
     viewers: viewerCount(),
-    hostOnline: Boolean(stream.hostId)
+    hostOnline: Boolean(stream.hostId),
+    /* 主播信令断了但还没过宽限期：观众端提示「正在重连」，不要直接判死 */
+    hostReconnecting: hostGraceUntil > Date.now()
   };
 }
 
@@ -185,6 +245,11 @@ function handleEvents(req, res, url) {
 
   if (!id) return json(res, 400, { error: 'missing id' });
 
+  /* host 身份必须凭口令取得，否则任何人都能抢走整个直播间 */
+  if (role === 'host' && !keyOk(url.searchParams.get('key') || '')) {
+    return json(res, 401, { error: '开播口令不正确' });
+  }
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -204,7 +269,16 @@ function handleEvents(req, res, url) {
   clients.set(id, { id, role, res, name, joinedAt: Date.now() });
 
   if (role === 'host') {
+    // 换了一台设备/换了标签页开播：让旧的那个安静退场
+    if (stream.hostId && stream.hostId !== id) {
+      const stale = clients.get(stream.hostId);
+      if (stale) {
+        try { stale.res.end(); } catch (err) { /* noop */ }
+        clients.delete(stream.hostId);
+      }
+    }
     stream.hostId = id;
+    clearHostGrace(); // 宽限期内回来了 → 这场直播继续
   }
 
   // 首包
@@ -220,24 +294,28 @@ function handleEvents(req, res, url) {
 
   startHeartbeat();
 
+  let cleaned = false;
   const cleanup = () => {
-    const current = clients.get(id);
-    if (current && current.res === res) clients.delete(id);
+    if (cleaned) return;
+    cleaned = true;
 
-    if (role === 'host' && stream.hostId === id) {
-      stream.hostId = null;
-      if (stream.live) {
-        stream.live = false;
-        stream.startedAt = null;
-        broadcast('stream-ended', { reason: 'host-disconnected' });
-      }
+    const current = clients.get(id);
+    const isCurrent = Boolean(current && current.res === res);
+    if (isCurrent) clients.delete(id);
+    if (lastChatAt.has(id)) lastChatAt.delete(id);
+
+    if (role === 'host') {
+      /* 已经被同 id 的新连接顶替：这条旧连接的关闭与直播状态无关 */
+      if (!isCurrent) return;
+      if (stream.hostId === id) stream.hostId = null;
+      if (stream.live) startHostGrace();
+      else clearHostGrace();
       broadcastState();
-    } else {
-      if (role === 'viewer' && stream.hostId) {
-        sendTo(stream.hostId, 'viewer-left', { id });
-      }
-      broadcastState();
+      return;
     }
+
+    if (isCurrent && stream.hostId) sendTo(stream.hostId, 'viewer-left', { id });
+    broadcastState();
   };
 
   req.on('close', cleanup);
@@ -287,13 +365,45 @@ async function handleApi(req, res, url) {
     return json(res, 200, statePayload());
   }
 
+  /* 开播端启动时问一次：这台服务器要不要口令？
+     只回答「要不要」，不泄露口令本身，也不需要鉴权。 */
+  if (req.method === 'GET' && route === '/api/config') {
+    return json(res, 200, {
+      requireKey: Boolean(STREAM_KEY),
+      hostGraceMs: HOST_GRACE_MS,
+      chatMinInterval: CHAT_MIN_INTERVAL
+    });
+  }
+
+  /* 校验口令（开播页在真正连 SSE 之前先问一句，便于给出明确提示） */
+  if (req.method === 'GET' && route === '/api/auth') {
+    if (!STREAM_KEY) return json(res, 200, { ok: true, requireKey: false });
+    const ok = keyOk(url.searchParams.get('key') || '');
+    return json(res, ok ? 200 : 401, ok ? { ok: true, requireKey: true } : { ok: false, error: '开播口令不正确' });
+  }
+
   if (req.method === 'POST' && route === '/api/signal') {
     let body;
     try { body = await readBody(req); } catch (err) { return json(res, 400, { error: 'bad body' }); }
     const { from, to, data } = body || {};
     if (!from || !to || !data) return json(res, 400, { error: 'from/to/data required' });
-    if (!clients.has(to)) return json(res, 200, { delivered: false });
-    sendTo(to, 'signal', { from, data });
+
+    /* 不信任请求体里的 from：必须是当前真实在线的连接，
+       from 由服务端认定后覆盖转发，伪造发信人这条路就断了。 */
+    const fromId = String(from).slice(0, 64);
+    const toId = String(to).slice(0, 64);
+    const sender = clients.get(fromId);
+    if (!sender) return json(res, 403, { error: 'sender not connected' });
+
+    const target = clients.get(toId);
+    if (!target) return json(res, 200, { delivered: false });
+
+    /* 只允许 host ↔ viewer 两个方向：观众之间互发一律拒绝 */
+    if (sender.role === target.role) {
+      return json(res, 403, { error: 'signal direction not allowed' });
+    }
+
+    sendTo(toId, 'signal', { from: sender.id, data });
     return json(res, 200, { delivered: true });
   }
 
@@ -305,18 +415,34 @@ async function handleApi(req, res, url) {
     const text = String(body.text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
     if (!text) return json(res, 400, { error: 'empty' });
 
+    /* 身份以 SSE 连接为准：连着的就用连接上的角色和昵称，
+       没连着的（直连 API）只按 IP 限速，且永远拿不到「主播」标签。 */
+    const clientId = String(body.clientId || body.id || '').slice(0, 64);
+    const conn = clientId ? clients.get(clientId) : null;
+    const role = conn && conn.role === 'host' ? 'host' : 'viewer';
+    const shownName = role === 'host' ? (conn.name || 'Luma') : name;
+
+    const rateKey = conn ? `c:${conn.id}` : `ip:${req.socket.remoteAddress || '?'}`;
     const now = Date.now();
-    if (now - (lastChatAt.get(name) || 0) < 350) {
+    if (now - (lastChatAt.get(rateKey) || 0) < CHAT_MIN_INTERVAL) {
       return json(res, 429, { error: 'too fast' });
     }
-    lastChatAt.set(name, now);
+    lastChatAt.set(rateKey, now);
+
+    /* Map 封顶，防止有人批量建连接把内存拖穿 */
+    if (lastChatAt.size > CHAT_RATE_MAP_MAX) {
+      for (const k of lastChatAt.keys()) {
+        lastChatAt.delete(k);
+        if (lastChatAt.size <= CHAT_RATE_MAP_MAX / 2) break;
+      }
+    }
 
     const msg = {
       id: `m${++chatSeq}`,
-      name,
+      name: shownName,
       text,
-      color: colorFor(name),
-      role: body.role === 'host' ? 'host' : 'viewer',
+      color: colorFor(shownName),
+      role,
       ts: now
     };
     chatLog.push(msg);
@@ -328,6 +454,11 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && route === '/api/stream') {
     let body;
     try { body = await readBody(req); } catch (err) { return json(res, 400, { error: 'bad body' }); }
+
+    if (STREAM_KEY && !keyOk(body.key || '')) {
+      return json(res, 401, { error: '开播口令不正确' });
+    }
+
     const id = String(body.id || '');
     if (!id || id !== stream.hostId) {
       return json(res, 403, { error: '只有已连接的开播端可以操作' });
@@ -344,6 +475,7 @@ async function handleApi(req, res, url) {
     }
 
     if (body.live === true) {
+      clearHostGrace();
       if (!stream.live) {
         stream.live = true;
         stream.startedAt = Date.now();
@@ -358,6 +490,7 @@ async function handleApi(req, res, url) {
     if (body.live === false && stream.live) {
       stream.live = false;
       stream.startedAt = null;
+      clearHostGrace();
       broadcastState();
       broadcast('stream-ended', { reason: 'host-stopped' });
       return json(res, 200, statePayload());
@@ -401,4 +534,11 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`LUMA Live 已启动 → http://localhost:${PORT}`);
   console.log(`  观众页  http://localhost:${PORT}/`);
   console.log(`  开播端  http://localhost:${PORT}/studio`);
+  if (STREAM_KEY) {
+    console.log('  开播口令  已启用（STREAM_KEY），开播端需要输入口令');
+  } else {
+    console.log('  开播口令  未启用 —— 任何能打开 /studio 的人都可以开播。');
+    console.log('            公网部署请设置环境变量 STREAM_KEY=你的口令');
+  }
+  if (HOST_GRACE_MS) console.log(`  断线宽限  ${HOST_GRACE_MS} ms（主播掉线后不立即结束直播）`);
 });

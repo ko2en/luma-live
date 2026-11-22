@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>LUMA · 开播控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%237c3aed'/%3E%3Crect x='11' y='11' width='10' height='10' rx='2' fill='%2308080b'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/styles.css?v=6" />
+<link rel="stylesheet" href="/styles.css?v=7" />
 </head>
 <body>
 <div class="ambient"></div>
@@ -73,6 +73,15 @@
       <input id="stream-title" class="title-input" data-title-input maxlength="90"
              value="在代码与夜色之间 · 独立开发的第 100 天" />
 
+      <div class="key-row" data-key-row hidden>
+        <label class="field-label" for="stream-key">开播口令</label>
+        <div class="key-field">
+          <input id="stream-key" class="title-input" data-key-input type="password"
+                 autocomplete="current-password" placeholder="输入服务器设置的 STREAM_KEY" />
+          <span class="key-state" data-key-state></span>
+        </div>
+      </div>
+
       <div class="media-grid">
         <label class="media-field">
           <span class="field-label">麦克风来源</span>
@@ -135,13 +144,22 @@
         <li>麦克风没反应：看下方电平表有没有跳动；不动就换一个「麦克风来源」，或点地址栏图标恢复权限。</li>
         <li>要共享电脑里播放的声音，共享时选「标签页」并勾选「分享标签页音频」。</li>
         <li>掉线后重新开播，观众端会自动重新接入。</li>
-        <li>关闭此页面即结束本场直播。</li>
+        <li>刷新页面不会中断直播：服务端会等你 10 秒，重连上就继续，超时才结束本场。</li>
+        <li>观众网络差时，这一路会自动降到 1.2M / 0.6M 码率，不会拖累其他人。</li>
+      </ul>
+    </div>
+    <div class="side-card">
+      <h3>安全</h3>
+      <ul class="tips">
+        <li>服务端设了 <code>STREAM_KEY</code> 时，开播前需要在上方填「开播口令」，口令只存在本机浏览器里。</li>
+        <li>观众不需要口令，打开链接就能看。</li>
+        <li>没设口令时谁都能打开这个页面开播——公网部署务必设置。</li>
       </ul>
     </div>
   </aside>
 </main>
 
 <div class="toast" data-toast></div>
-<script src="/studio.js?v=6"></script>
+<script src="/studio.js?v=7"></script>
 </body>
 </html>

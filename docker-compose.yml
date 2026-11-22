@@ -7,4 +7,7 @@ services:
       - "3000:3000"
     environment:
       PORT: 3000
+      # 开播口令：公网部署务必设置（不设则任何人打开 /studio 都能开播）
+      # STREAM_KEY: 换成你自己的口令
+      HOST_GRACE_MS: 10000
     restart: unless-stopped
