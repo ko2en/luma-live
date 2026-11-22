@@ -10,4 +10,36 @@ services:
       # 开播口令：公网部署务必设置（不设则任何人打开 /studio 都能开播）
       # STREAM_KEY: 换成你自己的口令
       HOST_GRACE_MS: 10000
+      # 口令限速：同一 IP 连续失败 5 次锁 60 秒
+      AUTH_MAX_FAILS: 5
+      AUTH_LOCK_MS: 60000
+      # 跑在反向代理后面时设 1，才会从 X-Forwarded-For 取真实来源 IP
+      # TRUST_PROXY: 1
+      # ---- TURN 中继（可选）----
+      # 三项全不设 = 只用 STUN 直连，行为与不配时完全一致。
+      # TURN_HOST 一旦设置，welcome 事件里就会带上服务端现签的 iceServers。
+      # TURN_HOST: turn.example.com
+      # TURN_PORT: 3478
+      # TURN_TLS_PORT: 5349
+      # 必须和 coturn 的 static-auth-secret 完全一致
+      # TURN_STATIC_AUTH_SECRET: 换成 openssl rand -hex 32 的输出
     restart: unless-stopped
+
+  # 可选：把 coturn 也放进同一个 compose。
+  # 注意它必须用 host 网络（中继要拿真实网卡地址和一大段 UDP 端口），
+  # 且 external-ip 要写公网 IP，否则发给观众的是容器内网地址。
+  # turn:
+  #   image: coturn/coturn:latest
+  #   network_mode: host
+  #   restart: unless-stopped
+  #   command: >
+  #     -n --log-file=stdout
+  #     --listening-port=3478 --tls-listening-port=5349
+  #     --fingerprint --lt-cred-mech --use-auth-secret
+  #     --static-auth-secret=换成与 TURN_STATIC_AUTH_SECRET 相同的值
+  #     --realm=turn.example.com
+  #     --external-ip=203.0.113.10
+  #     --min-port=49160 --max-port=49200
+  #     --cert=/etc/letsencrypt/live/turn.example.com/fullchain.pem
+  #     --pkey=/etc/letsencrypt/live/turn.example.com/privkey.pem
+  #     --no-cli --no-multicast-peers

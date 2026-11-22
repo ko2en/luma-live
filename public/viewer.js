@@ -4,12 +4,21 @@
   /* ================= 基础 ================= */
 
   const $ = (sel, root = document) => root.querySelector(sel);
+  /* ICE 默认值（纯 STUN 直连）。服务端 welcome 里下发 iceServers 时会被覆盖，
+     所以配了 TURN 的部署不用改前端；没配的部署行为与以前完全一致。 */
   const ICE = {
     iceServers: [
       { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
       { urls: 'stun:global.stun.twilio.com:3478' }
     ]
   };
+
+  function applyIce(cfg) {
+    if (!cfg) return;
+    const list = Array.isArray(cfg) ? cfg : cfg.iceServers;
+    if (!Array.isArray(list) || !list.length) return;
+    ICE.iceServers = list;
+  }
 
   const el = {
     player: $('[data-player]'),
@@ -496,6 +505,7 @@
 
     es.addEventListener('welcome', (e) => {
       const data = JSON.parse(e.data);
+      applyIce(data.ice);
       applyState(data);
       el.chatList.querySelectorAll('.msg, .msg-notice').forEach((n) => n.remove());
       seen.clear();
@@ -570,9 +580,15 @@
     let received = 0;
     let lost = 0;
     let rtt = 0;
+    let relay = false;
 
     try {
       const stats = await pc.getStats();
+      /* candidate-pair 与 local-candidate 必须在同一次 getStats 结果里关联，
+         跨采样周期匹配会拿到上一次的候选对，判定就乱了。 */
+      const byId = new Map();
+      stats.forEach((r) => byId.set(r.id, r));
+
       stats.forEach((r) => {
         if (r.type === 'inbound-rtp' && r.kind === 'video' && typeof r.bytesReceived === 'number') {
           bytes = r.bytesReceived;
@@ -583,6 +599,16 @@
           rtt = Math.max(rtt, r.currentRoundTripTime);
         }
       });
+
+      /* 当前生效的候选对：Chrome 会标 selected，没有就挑已 nominated 的 */
+      let pair = null;
+      for (const r of byId.values()) {
+        if (r.type !== 'candidate-pair') continue;
+        if (r.selected === true) { pair = r; break; }
+        if (r.state === 'succeeded' && (r.nominated === true || (r.bytesReceived || 0) > 0)) pair = r;
+      }
+      const local = pair && pair.localCandidateId ? byId.get(pair.localCandidateId) : null;
+      relay = Boolean(local && local.candidateType === 'relay');
     } catch (err) {
       sampling = false;
       return;
@@ -616,7 +642,13 @@
     sampling = false;
 
     postSignal(hostId, {
-      stats: { kbps, loss: Number(loss.toFixed(3)), rtt: Math.round(rtt * 1000) }
+      stats: {
+        kbps,
+        loss: Number(loss.toFixed(3)),
+        rtt: Math.round(rtt * 1000),
+        /* relay=true 表示这一路在走 TURN 中继，主播端会据此压低码率省服务器带宽 */
+        relay
+      }
     });
   }
 

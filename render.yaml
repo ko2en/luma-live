@@ -13,3 +13,22 @@ services:
         sync: false
       - key: HOST_GRACE_MS
         value: "10000"
+      - key: AUTH_MAX_FAILS
+        value: "5"
+      - key: AUTH_LOCK_MS
+        value: "60000"
+      # Render 自己就是反向代理：口令限速要按真实来源 IP 计数，必须打开这个
+      - key: TRUST_PROXY
+        value: "1"
+      # ---- TURN 中继（可选）----
+      # 注意：Render 只提供 HTTP/HTTPS，没有 UDP，coturn 跑不到这里。
+      # 下面的变量指向你在别处（有公网 IP 的云主机）自建的 coturn。
+      # 不填 = 只用 STUN 直连，行为与不配时完全一致。
+      # - key: TURN_HOST
+      #   sync: false
+      # - key: TURN_PORT
+      #   value: "3478"
+      # - key: TURN_TLS_PORT
+      #   value: "5349"
+      # - key: TURN_STATIC_AUTH_SECRET
+      #   sync: false

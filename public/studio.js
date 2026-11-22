@@ -3,12 +3,21 @@
 
   const $ = (sel, root = document) => root.querySelector(sel);
 
+  /* ICE 默认值（纯 STUN 直连）。服务端 welcome 里下发 iceServers 时会被覆盖，
+     配了 TURN 的部署不需要改前端；没配的部署行为与以前完全一致。 */
   const ICE = {
     iceServers: [
       { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
       { urls: 'stun:global.stun.twilio.com:3478' }
     ]
   };
+
+  function applyIce(cfg) {
+    if (!cfg) return;
+    const list = Array.isArray(cfg) ? cfg : cfg.iceServers;
+    if (!Array.isArray(list) || !list.length) return;
+    ICE.iceServers = list;
+  }
 
   const el = {
     preview: $('[data-preview]'),
@@ -910,15 +919,19 @@
   function tierFor(stats) {
     const loss = Number(stats && stats.loss) || 0;
     const rtt = Number(stats && stats.rtt) || 0;
-    if (loss > 0.08 || rtt > 500) return 'low';
-    if (loss > 0.03 || rtt > 250) return 'mid';
-    return 'high';
+    let tier = 'high';
+    if (loss > 0.08 || rtt > 500) tier = 'low';
+    else if (loss > 0.03 || rtt > 250) tier = 'mid';
+    /* 走 TURN 中继的观众：流量过服务器，封顶 mid，别拿服务器的带宽换清晰度 */
+    if (stats && stats.relay && TIER_RANK[tier] > TIER_RANK.mid) return 'mid';
+    return tier;
   }
 
   function applyViewerStats(viewerId, stats) {
     const pc = peers.get(viewerId);
     if (!pc) return;
     pc.__lastStatsAt = Date.now();
+    pc.__relay = Boolean(stats && stats.relay);
 
     const want = tierFor(stats);
     const cur = pc.__tier || 'high';
@@ -967,6 +980,7 @@
 
     const pc = new RTCPeerConnection(ICE);
     pc.__tier = 'high';
+    pc.__relay = false;
     pc.__lastStatsAt = Date.now();
     peers.set(viewerId, pc);
 
@@ -1010,10 +1024,13 @@
     }
 
     const q = `role=host&id=${encodeURIComponent(hostId)}&name=Luma`;
+    /* TODO(安全)：EventSource 不能带 body，口令只能留在 query 里，会进反代访问日志。
+       等接上「/api/auth 换短期 token → SSE 带 token」后改成 token。 */
     es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}`);
 
     es.addEventListener('welcome', (e) => {
       const data = JSON.parse(e.data);
+      applyIce(data.ice);
       if (data.title) el.title.value = data.title;
       if (data.startedAt) startedAt = data.startedAt;
       if (keyRequired) setKeyState('口令正确', 'ok');
@@ -1103,12 +1120,21 @@
     es.onerror = async () => {
       if (es.readyState !== EventSource.CLOSED) return;
 
-      /* 口令错时 EventSource 不会自动重连，这里先分辨是「口令错」还是「网络断」，
+      /* 口令错 / 被限速时 EventSource 不会自动重连，这里先分辨原因，
          否则就会每 2.5 秒拿错口令去撞一次 401。 */
       if (keyRequired) {
         try {
-          const r = await fetch(`/api/auth?key=${encodeURIComponent(streamKey)}`);
-          if (r.status === 401) {
+          const r = await post('/api/auth', { key: streamKey });
+          if (r.status === 401 || r.status === 429) {
+            if (r.status === 429) {
+              const data = await r.json().catch(() => ({}));
+              const wait = Number(data.retryAfter) || 60;
+              setKeyState(`${wait} 秒后重试`, 'bad');
+              toast(`口令尝试太频繁，${wait} 秒后自动重试`);
+              clearTimeout(reconnectTimer);
+              reconnectTimer = setTimeout(connect, wait * 1000);
+              return;
+            }
             setKeyState('口令不对', 'bad');
             if (el.keyRow) el.keyRow.hidden = false;
             if (el.keyInput) el.keyInput.focus();
@@ -1158,8 +1184,15 @@
     if (lastBytes !== null && now > lastStatAt) {
       const kbps = Math.round(((bytes - lastBytes) * 8) / ((now - lastStatAt) / 1000) / 1000);
       let degraded = 0;
-      for (const pc of peers.values()) if (pc.__tier && pc.__tier !== 'high') degraded += 1;
-      el.stBitrate.textContent = `${kbps} kbps · ${peers.size} 路${degraded ? ` · ${degraded} 路降档` : ''}`;
+      let relayed = 0;
+      for (const pc of peers.values()) {
+        if (pc.__relay) relayed += 1;
+        if (pc.__tier && pc.__tier !== 'high') degraded += 1;
+      }
+      el.stBitrate.textContent =
+        `${kbps} kbps · ${peers.size} 路` +
+        (relayed ? ` · ${relayed} 路中继` : '') +
+        (degraded ? ` · ${degraded} 路降档` : '');
     }
     lastBytes = bytes;
     lastStatAt = now;
@@ -1188,7 +1221,12 @@
     if (!v) return false;
     setKeyState('校验中…');
     try {
-      const r = await fetch(`/api/auth?key=${encodeURIComponent(v)}`);
+      /* POST 而不是 GET：口令放 body，不进反向代理的访问日志 */
+      const r = await post('/api/auth', { key: v });
+      if (r.status === 429) {
+        setKeyState('尝试太频繁，稍后再试', 'bad');
+        return false;
+      }
       if (!r.ok) {
         setKeyState('口令不对', 'bad');
         return false;

@@ -17,7 +17,7 @@
 
 <br>
 
-[30 秒上手](#30-秒上手) · [鉴权与参数](#开播鉴权与运维参数) · [工作原理](#工作原理) · [安装与部署](#安装与部署) · [已知限制](#已知限制)
+[30 秒上手](#30-秒上手) · [鉴权与参数](#开播鉴权与运维参数) · [TURN 中继](#turn-中继) · [工作原理](#工作原理) · [安装与部署](#安装与部署) · [已知限制](#已知限制)
 
 </div>
 
@@ -76,19 +76,139 @@ STREAM_KEY=你的口令 node server.js
 
 口令比较用的是定长比较（`crypto.timingSafeEqual`），失败与成功耗时一致，不会被逐字节试探。
 
-三个环境变量：
+### 口令通道硬化
+
+- **口令只走 POST body**。`/api/auth` 只接受 `POST`，用 `GET` 打过去返回 `405`（带 `Allow: POST`）——这样口令不会出现在反向代理的 URL 访问日志、浏览器历史和 Referer 里。
+- **失败 5 次锁 60 秒**。`/api/auth`、开播端的 SSE 连接、`/api/stream` 三处共用同一份计数，按来源 IP 累计；锁定期间即使口令正确也返回 `429`，并带 `Retry-After`。开播页会显示「N 秒后重试」并自动等这么久再连，不会一直撞墙。
+- **来源 IP 的判定**。默认只认 TCP 连接的真实地址；跑在 Caddy / Nginx / 云平台反代后面时，所有请求的来源都是代理本身，需要设 `TRUST_PROXY=1` 才会读 `X-Forwarded-For` 的第一段。
+
+> 已知不足：`EventSource` 不能带 body，所以 host 的 SSE 连接仍把口令放在 query 里（`/api/events?role=host&key=...`），这部分会进反代日志。代码里留了 TODO，后续改成「`/api/auth` 换短期 token → SSE 带 token」即可彻底去掉。
+
+运维参数：
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `STREAM_KEY` | 空（不鉴权） | 开播口令。公网部署务必设置 |
 | `HOST_GRACE_MS` | `10000` | 主播信令断线后的宽限期。期间不结束直播，重连回来继续播；设 `0` 表示立刻结束 |
 | `CHAT_MIN_INTERVAL` | `350` | 同一连接的聊天最小间隔（毫秒） |
+| `AUTH_MAX_FAILS` | `5` | 同一 IP 连续失败多少次后锁定 |
+| `AUTH_LOCK_MS` | `60000` | 锁定多久（毫秒） |
+| `TRUST_PROXY` | 未设 | 设 `1` 表示从 `X-Forwarded-For` 取来源 IP（在反向代理后面才需要） |
 
 另外有几条硬规则写死在服务端，不靠前端自觉：
 
 - **信令只允许 host ↔ viewer 两个方向**。观众之间互发直接被拒（403），伪造发信人也会被拒——`from` 由服务端按真实在线连接覆写，不看请求体。
 - **聊天角色由连接决定**。自称 `role: "host"` 但没开播通道的，只会被当作观众。
 - **聊天限速按连接算**，换昵称绕不过去；限速表有上限，连接断开即回收。
+
+## TURN 中继
+
+**可选，但公网部署强烈建议。** 不开 TURN 也能用，但有一类观众会永远黑屏：**公司网络、校园网、部分手机热点**在中间做对称 NAT，P2P 打洞打不通，两端都拿不到对方的地址。这不是 bug，是 P2P 架构的固有缺口，唯一解法是让流量经一台中继服务器转发。
+
+配好之后：
+
+- 能直连的观众**仍然直连**，一个字节都不多花；
+- 只有打不通的那部分走中继，代价是吃服务器带宽（每人约 0.6–1.2 Mbps）；
+- 走中继的观众会被自动压到 **mid 档（1.2 Mbps 封顶）**，主播状态栏显示「N 路中继」，让你随时知道服务器上压了多少流量。
+
+### 1. 四个环境变量
+
+| 变量 | 例子 | 说明 |
+|---|---|---|
+| `TURN_HOST` | `turn.example.com` | 不设就完全走原来的 STUN 直连，行为与以前一致 |
+| `TURN_PORT` | `3478` | UDP/TCP 端口，同时兼作 STUN |
+| `TURN_TLS_PORT` | `5349` | `turns:` 端口；设 `0` 可关掉 TLS 通道 |
+| `TURN_STATIC_AUTH_SECRET` | 一串随机字符 | 与 coturn 的 `static-auth-secret` **必须完全一致** |
+
+```bash
+TURN_HOST=turn.example.com \
+TURN_STATIC_AUTH_SECRET=$(openssl rand -hex 32) \
+STREAM_KEY=你的口令 \
+node server.js
+```
+
+凭证不是写死的：服务端按 coturn 的 REST API 规则现签，`username` 是「过期时间戳:luma」，`credential` 是 `base64(HMAC-SHA1(secret, username))`，有效期 6 小时，随 `welcome` 事件下发。前端不需要任何配置，`webrtc-internals` 里能直接看到服务端给的 `iceServers`。
+
+### 2. 装 coturn
+
+```bash
+sudo apt update && sudo apt install -y coturn
+```
+
+配置文件 `/etc/turnserver.conf`：
+
+```ini
+listening-port=3478
+tls-listening-port=5349
+fingerprint
+
+# REST API 凭证：secret 必须和 TURN_STATIC_AUTH_SECRET 一模一样
+lt-cred-mech
+use-auth-secret
+static-auth-secret=把上面生成的那串粘过来
+realm=turn.example.com
+
+# 公网机器必须写公网 IP，否则发给观众的是内网地址，中继必然失败
+external-ip=203.0.113.10
+
+# 中继端口段：防火墙要整段放行，41 个端口够几十人同时中继
+min-port=49160
+max-port=49200
+
+# TLS 证书：必须是真证书（Let's Encrypt），自签的浏览器直接拒绝 turns
+cert=/etc/letsencrypt/live/turn.example.com/fullchain.pem
+pkey=/etc/letsencrypt/live/turn.example.com/privkey.pem
+no-tlsv1
+no-tlsv1_1
+
+# 禁止把中继当成进内网的跳板（这几个网段都是私网/保留段）
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.0.0.0-192.0.0.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+
+no-cli
+no-multicast-peers
+```
+
+`denied-peer-ip` 那几行不能省：不加的话，任何人都能借你的中继去探测你云上的内网（169.254 元数据服务、127.0.0.1 管理端口都在射程内）。
+
+### 3. 开机自启
+
+Debian/Ubuntu 的 coturn 装完默认是关闭的，要手动打开：
+
+```bash
+sudo sed -i 's/^#TURNSERVER_ENABLED=.*/TURNSERVER_ENABLED=1/' /etc/default/coturn
+sudo systemctl enable --now coturn
+sudo systemctl status coturn --no-pager
+```
+
+### 4. 云防火墙要放的端口
+
+| 端口 | 协议 | 用途 |
+|---|---|---|
+| 3478 | UDP **和** TCP | TURN / STUN 主端口 |
+| 5349 | TCP（建议 UDP 也放） | `turns:` TLS 通道 |
+| 49160–49200 | UDP | 中继端口段，必须整段放行 |
+
+安全组里漏了最后一段是最常见的故障：握手能成，画面永远不来，因为真正的媒体包全被丢了。
+
+### 5. 确认它真的生效了
+
+1. 打开 `chrome://webrtc-internals`，看 `iceServers` 里有没有你配的 `turn:` / `turns:`，`username` 是不是 `时间戳:luma`；
+2. 观众连上后看 `selected candidate pair`，`local-candidate` 的类型是 `relay` 就说明在走中继；
+3. 主播端状态栏会显示「N 路中继」——这是最省事的判断方式，不用开调试面板。
+
+> 注意：Render、Vercel 这类平台只给 HTTP/HTTPS，**没有 UDP**，coturn 放不上去。TURN 需要一台有公网 IP 的普通云主机（1 核 1G、按流量计费的最便宜那种就够）。
+
 
 ## 界面
 
@@ -170,7 +290,7 @@ flowchart LR
   ROOM --> UI
 ```
 
-## 五个值得一看的实现
+## 六个值得一看的实现
 
 **1. 用 SSE 而不是 WebSocket 做信令**
 `GET /api/events` 是普通 HTTP 长连接，穿反向代理、企业网关、CDN 都不需要额外配置；断开后浏览器自动重连。配合 `POST /api/signal` 做单向投递，实现起来比 WebSocket 简单一个数量级。全服务端共用一个 20 秒心跳定时器，而不是每个连接一个。
@@ -202,6 +322,22 @@ loss > 3% || rtt > 250ms  → 1200 kbps
 ```
 
 降档立即生效，升档要连续三次稳定才升，避免在边界来回抖。弱网观众不再拖累其他人，主播的上行也省下来。
+
+**6. TURN 凭证现签，前端零配置**
+中继要能用，又不能让 `static-auth-secret` 出现在前端代码里。做法是每次下发 `welcome` 时按 coturn 的 REST 规则现签一个临时凭证：
+
+```js
+const username = `${Math.floor(Date.now() / 1000) + 6 * 3600}:luma`;   // 6 小时后过期
+const credential = createHmac('sha1', secret).update(username).digest('base64');
+```
+
+客户端收到就覆盖 ICE 配置——`welcome` 会因 `EventSource` 重连重复下发，所以这个动作必须是幂等的。反过来，观众端每 3 秒在同一次 `getStats()` 里把 `candidate-pair.localCandidateId` 关联回 `local-candidate`，看 `candidateType` 是不是 `relay`：
+
+```js
+候选对 → localCandidateId → local-candidate.candidateType === 'relay'
+```
+
+一旦确认走中继，这一路立刻压到 mid 档 1.2 Mbps——因为中继的流量是服务器在付钱，不该为了多 1000 kbps 清晰度把出口带宽烧穿。
 
 ## 安装与部署
 
@@ -340,21 +476,22 @@ proxy_read_timeout 3600s;     # 长连接别被默认 60s 掐断
 ## 目录结构
 
 ```
-server.js            静态文件 + SSE 信令 + 聊天 + 房间状态（544 行）
+server.js            静态文件 + SSE 信令 + 聊天 + 房间状态 + ICE 下发（698 行）
 public/
   index.html         观众页
   studio.html        开播控制台
-  viewer.js          播放器 + 信令客户端 + 聊天 + 链路回报（651 行）
-  studio.js          采集、混音、逐观众建连、码率分档（1258 行）
+  viewer.js          播放器 + 信令客户端 + 聊天 + 链路回报 + 中继识别（683 行）
+  studio.js          采集、混音、逐观众建连、码率分档（1296 行）
   styles.css         全部样式
 scripts/
-  test-api.js        服务端回归：鉴权 / 信令方向 / 断线宽限 / 聊天限速
-  test-studio-key.js 用真实浏览器验证口令流程（CDP 驱动）
-  test-e2e.js        开播 → 观看 → 刷新重连 的端到端验证
+  test-api.js         服务端回归：鉴权 / 口令限速 / 信令方向 / 断线宽限 / 聊天限速 / ICE 下发
+  test-studio-key.js  用真实浏览器验证口令流程（CDP 驱动）
+  test-e2e.js         开播 → 观看 → 刷新重连 的端到端验证
+  test-relay.js       把候选类型伪装成 relay，验证中继观众被压到 mid 档
 docs/                README 用的截图
 ```
 
-三个测试脚本都是零依赖的，`node scripts/test-api.js` 就能跑（会自动起一个带口令的临时服务）。
+三个测试脚本都是零依赖的，`node scripts/test-api.js` 就能跑（会自动起一个带口令的临时服务，54 项断言）。
 
 ## 已知限制
 
@@ -363,23 +500,27 @@ docs/                README 用的截图
 | 限制 | 原因 | 缓解方式 |
 |---|---|---|
 | 约 150 人同时在线 | 托管层单实例并发长连接配额 | 换更大的实例 / 前置 CDN |
-| 对称 NAT 下黑屏 | 没有 TURN 中继，P2P 打不通就无解 | 加 coturn |
+| 对称 NAT 下黑屏 | P2P 打洞打不通 | **配 TURN**（见上一节），配好后自动降级为中继 |
 | 主播上行 = 观众数 × 码率 | 每个观众一份独立编码 | 家用宽带约 10 人上限 |
+| 中继吃服务器带宽 | 走 TURN 的观众流量过服务器 | 已自动压到 mid 档；中继人数在状态栏可见 |
 | 无回看、无录制 | 不落盘 | 需要单独做录制链路 |
 | 重启丢状态 | 全内存实现 | 主播需保持页面打开 |
 
-打洞失败现在会明确告诉你「连不上主播的画面，换网络试试」，而不是让你盯着「正在接入画面…」等到放弃。但**看清原因不等于解决**——真要兼容严格的企业网络，还是得加 TURN。
+打洞失败现在会明确告诉你「连不上主播的画面，换网络试试」，而不是让你盯着「正在接入画面…」等到放弃。真要兼容严格的企业网络，配 TURN 就行——但那是另一台机器、另一笔流量费。
 
 要突破人数上限，必须换成 SFU（mediasoup / LiveKit）——由服务器分发而不是主播逐份推。这不是调参能解决的。
 
 ## 路线图
 
-- [x] 开播鉴权（`STREAM_KEY`）
+- [x] 开播鉴权（`STREAM_KEY`）+ 口令限速（5 次 / 60 秒）
+- [x] 口令走 POST body，不再进反向代理访问日志
 - [x] 信令方向校验 + 服务端覆写 `from`
 - [x] 主播断线宽限期（`HOST_GRACE_MS`）
 - [x] 按观众网络自适应码率（2.5 / 1.2 / 0.6 Mbps）
 - [x] 打洞失败给出可读提示 + 半死连接自检
-- [ ] TURN 中继（解决对称 NAT 黑屏）
+- [x] TURN 中继（coturn + REST 凭证，服务端下发 ICE 配置）
+- [x] 中继观众识别 + 限码率
+- [ ] SSE 用短期 token 取代 query 里的口令
 - [ ] 分辨率分档（360p / 540p / 720p，而不只是码率）
 - [ ] 录像与回看（MediaRecorder 落盘）
 - [ ] 可选 SFU 模式，突破点对点人数上限

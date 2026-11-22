@@ -25,6 +25,33 @@ const HOST_GRACE_MS = Math.max(0, Number(process.env.HOST_GRACE_MS || 10000));
 const CHAT_MIN_INTERVAL = Math.max(0, Number(process.env.CHAT_MIN_INTERVAL || 350));
 const CHAT_RATE_MAP_MAX = 1000;
 
+/* 口令尝试限速：按来源 IP 计数，连续失败若干次锁一段时间。
+   公网上的 /api/auth 和 host 的 SSE 连接都算一次尝试，防止离线爆破。 */
+const AUTH_MAX_FAILS = Math.max(1, Number(process.env.AUTH_MAX_FAILS || 5));
+const AUTH_LOCK_MS = Math.max(0, Number(process.env.AUTH_LOCK_MS || 60_000));
+const AUTH_MAP_MAX = 1000;
+/* 默认只认 socket 地址（伪造不了）。跑在 Caddy / Nginx / 平台反代后面时
+   所有请求的来源都是代理本身，要设 TRUST_PROXY=1 才读 X-Forwarded-For。 */
+const TRUST_PROXY = process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true';
+
+/* ---------------- TURN（全部可选，不配就完全走原来的 STUN 直连） ----------------
+   TURN_HOST 一旦设置，welcome 事件里就会带上服务端生成的 iceServers，
+   凭证按 coturn 的 REST API 方式（static-auth-secret）用 HMAC-SHA1 现签，
+   有效期 6 小时。没有 TURN_STATIC_AUTH_SECRET 时退化成无凭证的匿名中继。 */
+const TURN_HOST = String(process.env.TURN_HOST || '').trim();
+const TURN_PORT = String(process.env.TURN_PORT || '3478').trim();
+const TURN_TLS_PORT = String(process.env.TURN_TLS_PORT || '5349').trim();
+const TURN_STATIC_AUTH_SECRET = String(process.env.TURN_STATIC_AUTH_SECRET || '').trim();
+const TURN_TTL_SEC = 6 * 60 * 60;
+const TURN_USER = 'luma';
+
+/* 默认 STUN：不配 TURN 时就是这一份，行为和以前完全一致 */
+const DEFAULT_STUN = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+  'stun:global.stun.twilio.com:3478'
+];
+
 /* ------------------------------------------------------------------ *
  * 内存状态（直播间是实时的，重启即清空，符合直播语义）
  * ------------------------------------------------------------------ */
@@ -87,6 +114,89 @@ function safeEqual(a, b) {
 function keyOk(candidate) {
   if (!STREAM_KEY) return true;
   return safeEqual(candidate, STREAM_KEY);
+}
+
+/* ------------------------------------------------------------------ *
+ * 口令尝试限速
+ * ------------------------------------------------------------------ */
+
+const authFails = new Map(); // ip -> { n, until, at }
+
+function ipOf(req) {
+  if (TRUST_PROXY) {
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    if (xff) return xff;
+  }
+  return req.socket.remoteAddress || '?';
+}
+
+/* 还剩多少毫秒解锁；0 表示没锁 */
+function authLockLeft(req) {
+  const rec = authFails.get(ipOf(req));
+  if (!rec) return 0;
+  const left = rec.until - Date.now();
+  return left > 0 ? left : 0;
+}
+
+function noteAuthFail(req) {
+  const ip = ipOf(req);
+  const now = Date.now();
+  const rec = authFails.get(ip) || { n: 0, until: 0 };
+  rec.n += 1;
+  rec.at = now;
+  if (rec.n >= AUTH_MAX_FAILS) rec.until = now + AUTH_LOCK_MS;
+  authFails.set(ip, rec);
+
+  /* 封顶，防止有人换着 IP 撑爆内存 */
+  if (authFails.size > AUTH_MAP_MAX) {
+    for (const k of authFails.keys()) {
+      authFails.delete(k);
+      if (authFails.size <= AUTH_MAP_MAX / 2) break;
+    }
+  }
+}
+
+function clearAuthFail(req) {
+  authFails.delete(ipOf(req));
+}
+
+/* 统一的 429 响应：告诉调用方等多久 */
+function tooMany(res, leftMs) {
+  const sec = Math.max(1, Math.ceil(leftMs / 1000));
+  return json(res, 429, { error: `尝试太频繁，请 ${sec} 秒后再试`, retryAfter: sec }, { 'Retry-After': String(sec) });
+}
+
+/* ------------------------------------------------------------------ *
+ * ICE 配置（服务端下发，避免把 TURN 凭证硬编码到前端）
+ * ------------------------------------------------------------------ */
+
+function icePayload() {
+  const servers = [{ urls: DEFAULT_STUN.slice() }];
+
+  if (TURN_HOST) {
+    /* coturn 与 TURN 共用 3478，顺手当 STUN 用：部分网络里 Google 的 STUN 不可达 */
+    servers.push({ urls: [`stun:${TURN_HOST}:${TURN_PORT}`] });
+
+    const urls = [
+      `turn:${TURN_HOST}:${TURN_PORT}?transport=udp`,
+      `turn:${TURN_HOST}:${TURN_PORT}?transport=tcp`
+    ];
+    if (TURN_TLS_PORT && TURN_TLS_PORT !== '0') {
+      urls.push(`turns:${TURN_HOST}:${TURN_TLS_PORT}?transport=tcp`);
+    }
+
+    const entry = { urls };
+    if (TURN_STATIC_AUTH_SECRET) {
+      /* coturn REST 凭证：username = "<过期时间戳>:<用户名>"，
+         credential = base64(HMAC-SHA1(secret, username))。两端 secret 必须一致。 */
+      const username = `${Math.floor(Date.now() / 1000) + TURN_TTL_SEC}:${TURN_USER}`;
+      entry.username = username;
+      entry.credential = crypto.createHmac('sha1', TURN_STATIC_AUTH_SECRET).update(username).digest('base64');
+    }
+    servers.push(entry);
+  }
+
+  return { iceServers: servers, ttl: TURN_TTL_SEC };
 }
 
 function clearHostGrace() {
@@ -186,13 +296,13 @@ function flushState() {
   broadcast('state', statePayload());
 }
 
-function json(res, code, obj) {
+function json(res, code, obj, headers) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, {
+  res.writeHead(code, Object.assign({
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(body)
-  });
+  }, headers || {}));
   res.end(body);
 }
 
@@ -245,9 +355,16 @@ function handleEvents(req, res, url) {
 
   if (!id) return json(res, 400, { error: 'missing id' });
 
-  /* host 身份必须凭口令取得，否则任何人都能抢走整个直播间 */
-  if (role === 'host' && !keyOk(url.searchParams.get('key') || '')) {
-    return json(res, 401, { error: '开播口令不正确' });
+  /* host 身份必须凭口令取得，否则任何人都能抢走整个直播间。
+     失败计入 IP 限速：爆破 5 次就锁 60 秒。 */
+  if (role === 'host') {
+    const left = authLockLeft(req);
+    if (left > 0) return tooMany(res, left);
+    if (!keyOk(url.searchParams.get('key') || '')) {
+      noteAuthFail(req);
+      return json(res, 401, { error: '开播口令不正确' });
+    }
+    clearAuthFail(req);
   }
 
   res.writeHead(200, {
@@ -281,8 +398,11 @@ function handleEvents(req, res, url) {
     clearHostGrace(); // 宽限期内回来了 → 这场直播继续
   }
 
-  // 首包
-  sendTo(id, 'welcome', { id, role, ...statePayload() });
+  /* 首包。ICE 配置每次下发都重新签名，客户端收到就覆盖（幂等）：
+     EventSource 断线重连会让 welcome 再来一遍，不能只在第一次生效。
+     TODO(安全)：EventSource 不支持自定义 POST，host 的口令只能留在 query 里，
+     会进反向代理的访问日志。等改为「/api/auth 换短期 token → SSE 带 token」后去掉。 */
+  sendTo(id, 'welcome', { id, role, ice: icePayload(), ...statePayload() });
   sendTo(id, 'history', chatLog.slice(-80));
   if (role === 'viewer') {
     if (stream.live && stream.hostId && stream.hostId !== id) {
@@ -375,11 +495,27 @@ async function handleApi(req, res, url) {
     });
   }
 
-  /* 校验口令（开播页在真正连 SSE 之前先问一句，便于给出明确提示） */
-  if (req.method === 'GET' && route === '/api/auth') {
+  /* 校验口令（开播页在真正连 SSE 之前先问一句，便于给出明确提示）。
+     只接受 POST：口令走 body，不会出现在反向代理的 URL 访问日志里。 */
+  if (route === '/api/auth') {
+    if (req.method !== 'POST') {
+      return json(res, 405, { error: 'method not allowed，请用 POST' }, { Allow: 'POST' });
+    }
+
+    const left = authLockLeft(req);
+    if (left > 0) return tooMany(res, left);
+
+    let body;
+    try { body = await readBody(req); } catch (err) { return json(res, 400, { error: 'bad body' }); }
+
     if (!STREAM_KEY) return json(res, 200, { ok: true, requireKey: false });
-    const ok = keyOk(url.searchParams.get('key') || '');
-    return json(res, ok ? 200 : 401, ok ? { ok: true, requireKey: true } : { ok: false, error: '开播口令不正确' });
+
+    if (!keyOk(body && body.key ? body.key : '')) {
+      noteAuthFail(req);
+      return json(res, 401, { ok: false, error: '开播口令不正确' });
+    }
+    clearAuthFail(req);
+    return json(res, 200, { ok: true, requireKey: true });
   }
 
   if (req.method === 'POST' && route === '/api/signal') {
@@ -455,8 +591,15 @@ async function handleApi(req, res, url) {
     let body;
     try { body = await readBody(req); } catch (err) { return json(res, 400, { error: 'bad body' }); }
 
-    if (STREAM_KEY && !keyOk(body.key || '')) {
-      return json(res, 401, { error: '开播口令不正确' });
+    /* 这里也校验口令：/api/stream 会回 401 / 403 两种错，不设防就成了爆破探针 */
+    if (STREAM_KEY) {
+      const left = authLockLeft(req);
+      if (left > 0) return tooMany(res, left);
+      if (!keyOk(body.key || '')) {
+        noteAuthFail(req);
+        return json(res, 401, { error: '开播口令不正确' });
+      }
+      clearAuthFail(req);
     }
 
     const id = String(body.id || '');
@@ -541,4 +684,15 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log('            公网部署请设置环境变量 STREAM_KEY=你的口令');
   }
   if (HOST_GRACE_MS) console.log(`  断线宽限  ${HOST_GRACE_MS} ms（主播掉线后不立即结束直播）`);
+  if (TURN_HOST) {
+    const chans = ['udp', 'tcp'];
+    if (TURN_TLS_PORT && TURN_TLS_PORT !== '0') chans.push('tls');
+    console.log(`  TURN 中继 ${TURN_HOST}:${TURN_PORT} · ${chans.join('/')} · 最近凭证 ${TURN_TTL_SEC / 3600}h`);
+    if (!TURN_STATIC_AUTH_SECRET) {
+      console.log('            未设 TURN_STATIC_AUTH_SECRET —— 用匿名中继，coturn 需开 no-auth');
+    }
+  } else {
+    console.log('  TURN 中继 未配置 —— 打洞失败的观众会黑屏（设 TURN_HOST 可补上）');
+  }
+  if (AUTH_LOCK_MS) console.log(`  口令限速 ${AUTH_MAX_FAILS} 次失败锁 ${AUTH_LOCK_MS / 1000}s${TRUST_PROXY ? '（读 X-Forwarded-For）' : ''}`);
 });
