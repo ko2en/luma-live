@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>LUMA · 开播控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%237c3aed'/%3E%3Crect x='11' y='11' width='10' height='10' rx='2' fill='%2308080b'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/styles.css?v=11" />
+<link rel="stylesheet" href="/styles.css?v=12" />
 </head>
 <body>
 <div class="ambient"></div>
@@ -45,6 +45,18 @@
         <div class="preview-actions">
           <button class="solid-btn" data-open-tab type="button" hidden>在新标签页打开</button>
           <button class="line-btn" data-retry-cam type="button" hidden>重试授权</button>
+        </div>
+      </div>
+
+      <div class="taken-over" data-taken-over hidden>
+        <div class="taken-over-inner">
+          <span class="taken-tag">已被接管</span>
+          <strong>已在别处开播</strong>
+          <p>同一个开播口令只允许一台开播端在线。这个标签页已经停播，摄像头和麦克风也已释放。</p>
+          <div class="preview-actions">
+            <button class="solid-btn" data-take-over type="button">在这里继续开播</button>
+            <a class="line-btn" href="/" target="_blank" rel="noopener">去观众页看看</a>
+          </div>
         </div>
       </div>
 
@@ -162,6 +174,6 @@
 </main>
 
 <div class="toast" data-toast></div>
-<script src="/studio.js?v=11"></script>
+<script src="/studio.js?v=12"></script>
 </body>
 </html>

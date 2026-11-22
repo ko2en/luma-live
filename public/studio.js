@@ -54,6 +54,8 @@
     keyRow: $('[data-key-row]'),
     keyInput: $('[data-key-input]'),
     keyState: $('[data-key-state]'),
+    taken: $('[data-taken-over]'),
+    takeOverBtn: $('[data-take-over]'),
     toast: $('[data-toast]')
   };
 
@@ -92,6 +94,9 @@
   let streamKey = (localStorage.getItem('luma:key') || '').trim();
   let keyRequired = false;
   let es = null;
+  /* 被别处的开播台顶替了：页面要停手，且不许自动重连回来再顶回去，
+     否则两个标签页会每 2~3 秒互相踢一次，观众永远拿不到稳定的 offer。 */
+  let evicted = false;
 
   function toast(text) {
     el.toast.textContent = text;
@@ -815,9 +820,22 @@
     el.hint.textContent = live
       ? '观众端是点对点直连：每多一位观众，你的上行带宽就多占用一份。人多时请适当降低分辨率。'
       : '先说清楚：这是点对点直连，没有中心服务器转码。主播上行带宽 = 每位观众一份，适合几十人以内的自留地直播。';
+    if (evicted) {
+      el.goLive.classList.remove('is-live');
+      el.goLive.disabled = true;
+      el.goLive.textContent = '已在别处开播';
+      el.stStatus.textContent = '已在别处开播';
+      el.stStatus.className = 'v';
+      el.stBitrate.textContent = '—';
+      el.stSend.textContent = '—';
+    }
   }
 
   el.goLive.addEventListener('click', async () => {
+    if (evicted) {
+      toast('这个开播台已被别处接管，要点上面的「在这里继续开播」才能抢回来');
+      return;
+    }
     if (keyRequired && !streamKey) {
       const typed = el.keyInput ? el.keyInput.value.trim() : '';
       const ok = typed ? await useKey(typed) : false;
@@ -884,6 +902,19 @@
     }
   });
 
+  /* 被顶替后，人在这里明确点一下 → 强行接管（服务端带 takeover=1 才认） */
+  if (el.takeOverBtn) {
+    el.takeOverBtn.addEventListener('click', async () => {
+      el.takeOverBtn.disabled = true;
+      el.takeOverBtn.textContent = '正在接管…';
+      setEvicted(false);
+      await connect(true);
+      el.takeOverBtn.disabled = false;
+      el.takeOverBtn.textContent = '在这里继续开播';
+      toast('已接管这个开播台');
+    });
+  }
+
   /* 标题改动实时同步 */
   let titleTimer = null;
   el.title.addEventListener('input', () => {
@@ -926,6 +957,51 @@
     for (const id of Array.from(peers.keys())) closePeer(id);
     lastBytes = null;
     el.stBitrate.textContent = '—';
+  }
+
+  /* ================= 单主播保护：被顶替时安静退场 ================= */
+
+  /* 摄像头/麦克风一起放掉：被顶替的标签页不该继续占着设备，也不该亮着指示灯 */
+  function releaseCapture() {
+    if (usingScreen) {
+      try { stopScreen(); } catch (err) { /* noop */ }
+    }
+    if (camStream) {
+      camStream.getTracks().forEach((t) => { try { t.stop(); } catch (err) { /* noop */ } });
+      camStream = null;
+    }
+    camOn = false;
+    if (micStream) {
+      micStream.getTracks().forEach((t) => { try { t.stop(); } catch (err) { /* noop */ } });
+      micStream = null;
+    }
+    micOn = false;
+    applyStream(compose());
+    paintMediaState();
+  }
+
+  function setEvicted(on) {
+    evicted = Boolean(on);
+    if (el.taken) el.taken.hidden = !evicted;
+    paintLiveState();
+  }
+
+  /* 别处的开播台凭同一个口令上线了：这边立刻停播，且不再自动重连。
+     否则两边会互相顶替，每个 offer 都被打断，观众永远黑屏。 */
+  function handleHostTaken() {
+    if (evicted) return;
+    evicted = true;
+    clearTimeout(reconnectTimer);
+    if (es) {
+      try { es.close(); } catch (err) { /* noop */ }
+      es = null;
+    }
+    live = false;
+    startedAt = null;
+    closeAllPeers();
+    releaseCapture();
+    setEvicted(true);
+    toast('已在别处开播，这个标签页已停止推流');
   }
 
   /* 每个观众一条独立 RTCPeerConnection，天然可以单独设档。
@@ -1140,8 +1216,30 @@
 
   let reconnectTimer = null;
 
-  function connect() {
+  /* 连之前先问一句：这个 id 是不是已经被别处的开播台顶替了？
+     EventSource 拿不到 403 的响应体，只能靠这个接口判断该不该安静退场。 */
+  async function takenByOther() {
+    try {
+      const r = await fetch(`/api/host-status?id=${encodeURIComponent(hostId)}`, { cache: 'no-store' });
+      if (!r.ok) return false;
+      const s = await r.json();
+      return Boolean(s && s.taken);
+    } catch (err) {
+      return false; // 网络问题就当没事，照常连
+    }
+  }
+
+  async function connect(takeover) {
     clearTimeout(reconnectTimer);
+    /* 已经被顶替：除非人来点「在这里继续开播」，否则不再抢 */
+    if (evicted && !takeover) return;
+
+    if (!takeover && (await takenByOther())) {
+      handleHostTaken();
+      return;
+    }
+    if (takeover) setEvicted(false);
+
     if (es) {
       try { es.close(); } catch (err) { /* noop */ }
       es = null;
@@ -1150,7 +1248,11 @@
     const q = `role=host&id=${encodeURIComponent(hostId)}&name=Luma`;
     /* TODO(安全)：EventSource 不能带 body，口令只能留在 query 里，会进反代访问日志。
        等接上「/api/auth 换短期 token → SSE 带 token」后改成 token。 */
-    es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}`);
+    const tk = takeover ? '&takeover=1' : '';
+    es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}${tk}`);
+
+    /* 服务端切断这条连接之前会先发这一帧：说明不是网络抖动，是被接管了 */
+    es.addEventListener('host-taken', () => handleHostTaken());
 
     es.addEventListener('welcome', (e) => {
       const data = JSON.parse(e.data);
@@ -1242,7 +1344,15 @@
     });
 
     es.onerror = async () => {
-      if (es.readyState !== EventSource.CLOSED) return;
+      if (evicted) return;                                    // 已被接管，别再抢
+      if (!es || es.readyState !== EventSource.CLOSED) return;
+
+      /* 被别处顶替时服务端回 403，EventSource 直接 CLOSED 且自己不再重连。
+         先确认是不是「被接管」：是就安静退场，别每 2.5 秒回来顶一次。 */
+      if (await takenByOther()) {
+        handleHostTaken();
+        return;
+      }
 
       /* 口令错 / 被限速时 EventSource 不会自动重连，这里先分辨原因，
          否则就会每 2.5 秒拿错口令去撞一次 401。 */

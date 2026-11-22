@@ -83,6 +83,27 @@ const stream = {
 let hostGraceTimer = null;
 let hostGraceUntil = 0;
 
+/* 被顶替过的 host id。
+   只切断旧连接是不够的：旧页面上的 EventSource 会自动重连，一回来又把
+   新的顶掉，于是两个开播台每 2~3 秒互相踢一次，观众端的 offer 永远被打断，
+   表现就是「直播中但一直黑屏」。
+   这里记住「被谁顶下去的」，只要当前主播还活着就不许它再抢；
+   当前主播下线后名单作废（可能确实是换回来）。 */
+const supersededHosts = new Map(); // id -> ts
+const SUPERSEDED_MAX = 200;
+
+function noteSuperseded(id) {
+  if (!id) return;
+  supersededHosts.delete(id);
+  supersededHosts.set(id, Date.now());
+  if (supersededHosts.size > SUPERSEDED_MAX) {
+    for (const k of supersededHosts.keys()) {
+      supersededHosts.delete(k);
+      if (supersededHosts.size <= SUPERSEDED_MAX / 2) break;
+    }
+  }
+}
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -414,6 +435,18 @@ function handleEvents(req, res, url) {
       return json(res, 401, { error: '开播口令不正确' });
     }
     clearAuthFail(req);
+
+    /* 被顶替过的开播台：当前主播还活着就直接拒掉，别让它顶回来。
+       页面主动点「在这里继续开播」会带 takeover=1，那是人的明确意图。 */
+    const takeover = url.searchParams.get('takeover') === '1';
+    const current = stream.hostId ? clients.get(stream.hostId) : null;
+    if (!takeover && current && stream.hostId !== id && supersededHosts.has(id)) {
+      return json(res, 403, {
+        error: '已在别处开播',
+        code: 'host-taken',
+        hostId: stream.hostId
+      });
+    }
   }
 
   res.writeHead(200, {
@@ -434,14 +467,20 @@ function handleEvents(req, res, url) {
   clients.set(id, { id, role, session: req.session, res, name, joinedAt: Date.now() });
 
   if (role === 'host') {
-    // 换了一台设备/换了标签页开播：让旧的那个安静退场
+    /* 换了一台设备/换了标签页开播：让旧的那个安静退场。
+       先发 host-taken 再断流，旧页面才知道「不是网络抖动，是被人接管了」，
+       不会傻乎乎地自动重连回来把新的顶掉。 */
     if (stream.hostId && stream.hostId !== id) {
-      const stale = clients.get(stream.hostId);
+      const staleId = stream.hostId;
+      const stale = clients.get(staleId);
+      noteSuperseded(staleId);
       if (stale) {
+        sendTo(staleId, 'host-taken', { by: id, at: Date.now() });
         try { stale.res.end(); } catch (err) { /* noop */ }
-        clients.delete(stream.hostId);
+        clients.delete(staleId);
       }
     }
+    supersededHosts.delete(id); // 它现在就是主播，不再是「被顶替者」
     stream.hostId = id;
     clearHostGrace(); // 宽限期内回来了 → 这场直播继续
   }
@@ -456,6 +495,13 @@ function handleEvents(req, res, url) {
     if (stream.live && stream.hostId && stream.hostId !== id) {
       sendTo(stream.hostId, 'viewer-joined', { id, name });
     }
+  }
+  /* 主播重连（刷新页面、换设备、长连接被中间设备掐断后自愈）时，
+     在场观众不会再次触发 viewer-joined，主播也就不知道要给他们发 offer，
+     表现就是「直播中」但观众一直黑屏。这里补一次 go-live，主播端会
+     按 viewers 列表重建全部连接。 */
+  if (role === 'host' && stream.live) {
+    sendTo(id, 'go-live', { viewers: viewerIds() });
   }
 
   broadcastState();
@@ -478,6 +524,8 @@ function handleEvents(req, res, url) {
       /* 已经被同 id 的新连接顶替：这条旧连接的关闭与直播状态无关 */
       if (!isCurrent) return;
       if (stream.hostId === id) stream.hostId = null;
+      /* 没有主播了：此时谁都可以来接管，「被顶替」名单作废 */
+      if (!stream.hostId) supersededHosts.clear();
       if (stream.live) startHostGrace();
       else clearHostGrace();
       broadcastState();
@@ -547,6 +595,23 @@ async function handleApi(req, res, url) {
       requireKey: Boolean(STREAM_KEY),
       hostGraceMs: HOST_GRACE_MS,
       chatMinInterval: CHAT_MIN_INTERVAL
+    });
+  }
+
+  /* 开播端在重连之前先问一句：我这个 id 是不是已经被顶替了？
+     EventSource 拿不到 403 的响应体，只能靠这个接口判断「是不是该安静退场」，
+     不然被踢的页面会一直自动重连，和当前主播互相踢。 */
+  if (req.method === 'GET' && route === '/api/host-status') {
+    const id = String(url.searchParams.get('id') || '').slice(0, 64);
+    const host = stream.hostId ? clients.get(stream.hostId) : null;
+    return json(res, 200, {
+      hostId: stream.hostId,
+      hostOnline: Boolean(host),
+      live: stream.live,
+      mine: Boolean(id && stream.hostId === id),
+      superseded: Boolean(id && supersededHosts.has(id)),
+      /* 这个页面现在该不该安静退场 */
+      taken: Boolean(id && host && stream.hostId !== id && supersededHosts.has(id))
     });
   }
 
