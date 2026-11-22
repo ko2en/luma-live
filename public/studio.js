@@ -48,6 +48,7 @@
     stRes: $('[data-st-res]'),
     stSend: $('[data-st-send]'),
     stBitrate: $('[data-st-bitrate]'),
+    stConnections: $('[data-st-connections]'),
     share: $('[data-share-url]'),
     copy: $('[data-copy]'),
     keyRow: $('[data-key-row]'),
@@ -899,6 +900,16 @@
     post('/api/signal', { from: hostId, to, data }).catch(() => {});
   }
 
+  function paintConnections() {
+    const counts = { direct: 0, relay: 0, unknown: 0 };
+    if (live) for (const pc of peers.values()) {
+      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) continue;
+      counts[pc.connectionState === 'connected' ? (pc.__connectionType || 'unknown') : 'unknown'] += 1;
+    }
+    const text = `P2P ${counts.direct}路 / TURN ${counts.relay}路 / 检测中${counts.unknown}路`;
+    if (el.stConnections.textContent !== text) el.stConnections.textContent = text;
+  }
+
   function closePeer(viewerId) {
     const pc = peers.get(viewerId);
     if (!pc) return;
@@ -908,6 +919,7 @@
       pc.close();
     } catch (err) { /* noop */ }
     peers.delete(viewerId);
+    paintConnections();
   }
 
   function closeAllPeers() {
@@ -928,15 +940,18 @@
     if (loss > 0.08 || rtt > 500) tier = 'low';
     else if (loss > 0.03 || rtt > 250) tier = 'mid';
     /* 走 TURN 中继的观众：流量过服务器，封顶 mid，别拿服务器的带宽换清晰度 */
-    if (stats && stats.relay && TIER_RANK[tier] > TIER_RANK.mid) return 'mid';
+    if (stats && (stats.relay || stats.connectionType === 'relay') && TIER_RANK[tier] > TIER_RANK.mid) return 'mid';
     return tier;
   }
 
   function applyViewerStats(viewerId, stats) {
     const pc = peers.get(viewerId);
-    if (!pc) return;
+    if (!pc || pc.connectionState !== 'connected') return;
     pc.__lastStatsAt = Date.now();
-    pc.__relay = Boolean(stats && stats.relay);
+    pc.__connectionType = stats && ['direct', 'relay', 'unknown'].includes(stats.connectionType)
+      ? stats.connectionType : stats && stats.relay === true ? 'relay' : 'unknown';
+    pc.__relay = pc.__connectionType === 'relay' || Boolean(stats && stats.relay);
+    paintConnections();
 
     const want = tierFor(stats);
     const cur = pc.__tier || 'high';
@@ -1083,8 +1098,10 @@
     const pc = new RTCPeerConnection(ICE);
     pc.__tier = 'high';
     pc.__relay = false;
+    pc.__connectionType = 'unknown';
     pc.__lastStatsAt = Date.now();
     peers.set(viewerId, pc);
+    paintConnections();
 
     localStream.getTracks().forEach((track) => {
       try { pc.addTrack(track, localStream); } catch (err) { /* noop */ }
@@ -1099,6 +1116,11 @@
 
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
+      if (s !== 'connected') {
+        pc.__connectionType = 'unknown';
+        pc.__relay = false;
+      }
+      paintConnections();
       if (s === 'connected') tunePeer(pc);
       if (s === 'failed' || s === 'closed') {
         closePeer(viewerId);
@@ -1261,11 +1283,12 @@
 
   let statsPending = false;
   setInterval(async () => {
+    paintConnections();
     el.stTime.textContent = live && startedAt ? fmt(Date.now() - startedAt) : '00:00:00';
     el.stRes.textContent = resolutionText();
 
     if (!peers.size || !live) {
-      if (!live) el.stBitrate.textContent = '—';
+      el.stBitrate.textContent = '—';
       if (el.stSend) el.stSend.textContent = live ? '等待观众 · 目标30 fps' : '—';
       lastBytes = null;
       return;
@@ -1307,6 +1330,7 @@
         let degraded = 0;
         let relayed = 0;
         for (const pc of peers.values()) {
+          if (pc.connectionState !== 'connected') continue;
           if (pc.__relay) relayed += 1;
           if ((pc.__tier && pc.__tier !== 'high') || (pc.__videoState && pc.__videoState.step > 0)) degraded += 1;
         }

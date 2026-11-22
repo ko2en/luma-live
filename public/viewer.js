@@ -27,6 +27,7 @@
     idleTitle: $('[data-idle-title]'),
     idleSub: $('[data-idle-sub]'),
     badge: $('[data-live-badge]'),
+    connection: $('[data-connection-type]'),
     title: $('[data-title]'),
     titleEcho: $('[data-title-echo]'),
     streamer: $('[data-streamer]'),
@@ -164,10 +165,26 @@
     }
   }
 
+  function paintConnection(type) {
+    const labels = {
+      idle: ['未连接', '媒体尚未连接，是否使用 TURN 中继尚未确定。'],
+      connecting: ['连接中', '正在建立媒体连接，是否使用 TURN 中继尚未确定。'],
+      unknown: ['检测中', '媒体路径统计不足，暂不能确定是否使用 TURN 中继。'],
+      direct: ['P2P直连', '媒体在双方之间直接传输，不经过 TURN 中继。'],
+      relay: ['TURN中继', '媒体经过 TURN 服务器中继，任一端使用中继即计为 TURN。'],
+      reconnecting: ['断开重连中', '媒体连接已断开，正在恢复；旧路径状态已清除。']
+    };
+    const [text, title] = labels[type];
+    if (el.connection.textContent !== text) el.connection.textContent = text;
+    el.connection.title = title;
+    el.connection.dataset.connectionType = type;
+  }
+
   function waiting() {
     if (hardFail) return;
     el.idleTitle.textContent = '正在接入画面…';
-    el.idleSub.textContent = '已建立与主播的点对点连接，稍等一下。';
+    el.idleSub.textContent = '正在建立与主播的媒体连接，稍等一下。';
+    if (!pc || pc.connectionState !== 'connected') paintConnection('connecting');
     el.player.classList.remove('is-playing');
   }
 
@@ -356,6 +373,7 @@
   let stalledCount = 0;
 
   function closePeer() {
+    paintConnection('idle');
     clearTimeout(restartTimer);
     pendingCandidates = [];
     lastInbound = null;
@@ -436,8 +454,13 @@
     };
 
     peer.onconnectionstatechange = () => {
+      if (pc !== peer) return;
       const s = peer.connectionState;
+      paintConnection(s === 'connected' ? 'unknown'
+        : ['disconnected', 'failed'].includes(s) ? 'reconnecting'
+        : s === 'closed' ? 'idle' : 'connecting');
       if (s === 'connected') {
+        sampleLink();
         everConnected = true;
         failStreak = 0;
         hardFail = false;
@@ -571,6 +594,33 @@
 
   let sampling = false;
 
+  function selectedLink(stats) {
+    const byId = new Map();
+    stats.forEach((r) => byId.set(r.id, r));
+    const rows = [...byId.values()];
+    const transports = rows.filter((r) => r.type === 'transport' && r.selectedCandidatePairId);
+    let pair = null;
+    if (transports.length) {
+      // 标准引用存在但统计缺失时，不退回可能过期的 nominated 候选对。
+      const ids = new Set(transports.map((r) => r.selectedCandidatePairId));
+      if (ids.size === 1) pair = byId.get(transports[0].selectedCandidatePairId);
+    } else {
+      const selected = rows.filter((r) => r.type === 'candidate-pair' && r.selected === true);
+      const nominated = rows.filter((r) => r.type === 'candidate-pair' && r.nominated === true && r.state === 'succeeded');
+      if (selected.length === 1) pair = selected[0];
+      else if (!selected.length && nominated.length === 1) pair = nominated[0];
+    }
+    if (!pair || pair.type !== 'candidate-pair' || (pair.state && pair.state !== 'succeeded')) {
+      return { connectionType: 'unknown', rtt: 0 };
+    }
+    const local = byId.get(pair.localCandidateId);
+    const remote = byId.get(pair.remoteCandidateId);
+    const types = [local && local.candidateType, remote && remote.candidateType];
+    const connectionType = types.includes('relay') ? 'relay'
+      : types.every((type) => ['host', 'srflx', 'prflx'].includes(type)) ? 'direct' : 'unknown';
+    return { connectionType, rtt: typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime : 0 };
+  }
+
   async function sampleLink() {
     if (sampling || !state.live || !pc || !hostId) return;
     if (pc.connectionState !== 'connected') return;
@@ -581,14 +631,11 @@
     let received = 0;
     let lost = 0;
     let rtt = 0;
-    let relay = false;
+    let connectionType = 'unknown';
 
     try {
       const stats = await sampledPeer.getStats();
-      /* candidate-pair 与 local-candidate 必须在同一次 getStats 结果里关联，
-         跨采样周期匹配会拿到上一次的候选对，判定就乱了。 */
-      const byId = new Map();
-      stats.forEach((r) => byId.set(r.id, r));
+      ({ connectionType, rtt } = selectedLink(stats));
 
       stats.forEach((r) => {
         if (r.type === 'inbound-rtp' && r.kind === 'video' && typeof r.bytesReceived === 'number') {
@@ -596,36 +643,14 @@
           received = r.packetsReceived || 0;
           lost = r.packetsLost || 0;
         }
-        if (r.type === 'candidate-pair' && r.state === 'succeeded' && typeof r.currentRoundTripTime === 'number') {
-          rtt = Math.max(rtt, r.currentRoundTripTime);
-        }
       });
-
-      /* 标准 transport.selectedCandidatePairId 优先；兼容旧浏览器的 selected/nominated。 */
-      let pair = null;
-      for (const r of byId.values()) {
-        if (r.type === 'transport' && r.selectedCandidatePairId) {
-          pair = byId.get(r.selectedCandidatePairId);
-          if (pair) break;
-        }
-      }
-      for (const r of pair ? [] : byId.values()) {
-        if (r.type !== 'candidate-pair') continue;
-        if (r.selected === true) { pair = r; break; }
-        if (r.state === 'succeeded' && (r.nominated === true || (r.bytesReceived || 0) > 0)) pair = r;
-      }
-      const local = pair && pair.localCandidateId ? byId.get(pair.localCandidateId) : null;
-      const remote = pair && pair.remoteCandidateId ? byId.get(pair.remoteCandidateId) : null;
-      // 任一端使用 relay 都会消耗 TURN 带宽，不能只看观众自己的候选。
-      relay = Boolean((local && local.candidateType === 'relay') || (remote && remote.candidateType === 'relay'));
-      if (pair && typeof pair.currentRoundTripTime === 'number') rtt = pair.currentRoundTripTime;
     } catch (err) {
-      sampling = false;
-      return;
+      // 无统计也要清除旧路径并回报 unknown，避免继续展示旧的直连/中继。
     }
 
     // 采样期间可能已重建连接，旧结果不能污染新连接的计数和档位。
-    if (pc !== sampledPeer) { sampling = false; return; }
+    if (pc !== sampledPeer || sampledPeer.connectionState !== 'connected' || !state.live) { sampling = false; return; }
+    paintConnection(connectionType);
     const now = performance.now();
     let kbps = 0;
     let loss = 0;
@@ -659,7 +684,8 @@
         loss: Number(loss.toFixed(3)),
         rtt: Math.round(rtt * 1000),
         /* relay=true 表示这一路在走 TURN 中继，主播端会据此压低码率省服务器带宽 */
-        relay
+        relay: connectionType === 'relay',
+        connectionType
       }
     });
   }
