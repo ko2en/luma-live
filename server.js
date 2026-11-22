@@ -45,6 +45,19 @@ const TURN_STATIC_AUTH_SECRET = String(process.env.TURN_STATIC_AUTH_SECRET || ''
 const TURN_TTL_SEC = 6 * 60 * 60;
 const TURN_USER = 'luma';
 
+/* 附加 TURN 节点（多线路择优）：TURN_EXTRA="host:port:secret,host:port:secret"
+   浏览器会同时收集所有 relay 候选，谁先连通就用谁 —— 近的那条自然胜出。
+   注意：这些节点必须公网可达，且 relay 端口要和映射一一对应，否则候选是死的。 */
+const TURN_EXTRA = String(process.env.TURN_EXTRA || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map((s) => {
+    const [host, port, secret] = s.split(':');
+    return { host: (host || '').trim(), port: (port || '3478').trim(), secret: (secret || '').trim() };
+  })
+  .filter((t) => t.host);
+
 /* 默认 STUN：不配 TURN 时就是这一份，行为和以前完全一致 */
 const DEFAULT_STUN = [
   'stun:stun.l.google.com:19302',
@@ -206,30 +219,39 @@ function tooMany(res, leftMs) {
  * ICE 配置（服务端下发，避免把 TURN 凭证硬编码到前端）
  * ------------------------------------------------------------------ */
 
+/* 单个 TURN 节点的 iceServers 条目；凭证按 coturn REST 方式现签 */
+function turnEntry(host, port, secret, tlsPort) {
+  /* coturn 与 TURN 共用同一端口，顺手当 STUN 用：部分网络里 Google 的 STUN 不可达 */
+  const urls = [
+    `turn:${host}:${port}?transport=udp`,
+    `turn:${host}:${port}?transport=tcp`
+  ];
+  if (tlsPort && tlsPort !== '0') urls.push(`turns:${host}:${tlsPort}?transport=tcp`);
+
+  const entry = { urls };
+  if (secret) {
+    /* coturn REST 凭证：username = "<过期时间戳>:<用户名>"，
+       credential = base64(HMAC-SHA1(secret, username))。两端 secret 必须一致。 */
+    const username = `${Math.floor(Date.now() / 1000) + TURN_TTL_SEC}:${TURN_USER}`;
+    entry.username = username;
+    entry.credential = crypto.createHmac('sha1', secret).update(username).digest('base64');
+  }
+  return entry;
+}
+
+function iceNodes() {
+  const nodes = [];
+  if (TURN_HOST) nodes.push({ host: TURN_HOST, port: TURN_PORT, secret: TURN_STATIC_AUTH_SECRET, tls: TURN_TLS_PORT });
+  for (const t of TURN_EXTRA) nodes.push({ host: t.host, port: t.port, secret: t.secret, tls: '0' });
+  return nodes;
+}
+
 function icePayload() {
   const servers = [{ urls: DEFAULT_STUN.slice() }];
 
-  if (TURN_HOST) {
-    /* coturn 与 TURN 共用 3478，顺手当 STUN 用：部分网络里 Google 的 STUN 不可达 */
-    servers.push({ urls: [`stun:${TURN_HOST}:${TURN_PORT}`] });
-
-    const urls = [
-      `turn:${TURN_HOST}:${TURN_PORT}?transport=udp`,
-      `turn:${TURN_HOST}:${TURN_PORT}?transport=tcp`
-    ];
-    if (TURN_TLS_PORT && TURN_TLS_PORT !== '0') {
-      urls.push(`turns:${TURN_HOST}:${TURN_TLS_PORT}?transport=tcp`);
-    }
-
-    const entry = { urls };
-    if (TURN_STATIC_AUTH_SECRET) {
-      /* coturn REST 凭证：username = "<过期时间戳>:<用户名>"，
-         credential = base64(HMAC-SHA1(secret, username))。两端 secret 必须一致。 */
-      const username = `${Math.floor(Date.now() / 1000) + TURN_TTL_SEC}:${TURN_USER}`;
-      entry.username = username;
-      entry.credential = crypto.createHmac('sha1', TURN_STATIC_AUTH_SECRET).update(username).digest('base64');
-    }
-    servers.push(entry);
+  for (const node of iceNodes()) {
+    servers.push({ urls: [`stun:${node.host}:${node.port}`] });
+    servers.push(turnEntry(node.host, node.port, node.secret, node.tls));
   }
 
   return { iceServers: servers, ttl: TURN_TTL_SEC };
@@ -821,8 +843,13 @@ server.listen(PORT, '0.0.0.0', () => {
     if (!TURN_STATIC_AUTH_SECRET) {
       console.log('            未设 TURN_STATIC_AUTH_SECRET —— 用匿名中继，coturn 需开 no-auth');
     }
-  } else {
+  } else if (!TURN_EXTRA.length) {
     console.log('  TURN 中继 未配置 —— 打洞失败的观众会黑屏（设 TURN_HOST 可补上）');
+  }
+  /* 附加节点单独列出，方便一眼看出多线路是否都吃到了 */
+  for (const t of TURN_EXTRA) {
+    const mark = t.secret ? 'REST 凭证' : '匿名中继';
+    console.log(`  TURN 附加 ${t.host}:${t.port} · udp/tcp · ${mark}`);
   }
   if (AUTH_LOCK_MS) console.log(`  口令限速 ${AUTH_MAX_FAILS} 次失败锁 ${AUTH_LOCK_MS / 1000}s${TRUST_PROXY ? '（读 X-Forwarded-For）' : ''}`);
 });
