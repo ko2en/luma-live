@@ -1117,6 +1117,7 @@ input, button, textarea { font-size: 14px; }
 .kv:last-child { border-bottom: none; }
 .kv .k { font-size: 12.5px; color: var(--dim); }
 .kv .v { font-family: var(--mono); font-size: 12.5px; color: #d8d7e3; font-variant-numeric: tabular-nums; }
+.kv [data-st-send] { max-width: 72%; text-align: right; overflow-wrap: anywhere; }
 .kv .v.ok { color: var(--ok); }
 .kv .v.warn { color: #fbbf24; }
 

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>LUMA · 开播控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%237c3aed'/%3E%3Crect x='11' y='11' width='10' height='10' rx='2' fill='%2308080b'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/styles.css?v=9" />
+<link rel="stylesheet" href="/styles.css?v=10" />
 </head>
 <body>
 <div class="ambient"></div>
@@ -121,7 +121,8 @@
       <div class="kv"><span class="k">状态</span><span class="v" data-st-status>未开播</span></div>
       <div class="kv"><span class="k">同时在看</span><span class="v" data-st-viewers>0</span></div>
       <div class="kv"><span class="k">本场时长</span><span class="v" data-st-time>00:00:00</span></div>
-      <div class="kv"><span class="k">画面</span><span class="v" data-st-res>—</span></div>
+      <div class="kv"><span class="k">采集画面</span><span class="v" data-st-res>—</span></div>
+      <div class="kv"><span class="k">实际发送</span><span class="v" data-st-send>—</span></div>
       <div class="kv"><span class="k">声音</span><span class="v" data-st-audio>无</span></div>
       <div class="kv"><span class="k">上行码率</span><span class="v" data-st-bitrate>—</span></div>
     </div>
@@ -145,7 +146,7 @@
         <li>要共享电脑里播放的声音，共享时选「标签页」并勾选「分享标签页音频」。</li>
         <li>掉线后重新开播，观众端会自动重新接入。</li>
         <li>刷新页面不会中断直播：服务端会等你 10 秒，重连上就继续，超时才结束本场。</li>
-        <li>观众网络差时，这一路会自动降到 1.2M / 0.6M 码率，不会拖累其他人。</li>
+        <li>优先保持 30 fps；网络或编码吃紧时，逐路降低分辨率和码率，稳定后再升回来。实际帧率以状态栏为准。</li>
       </ul>
     </div>
     <div class="side-card">
@@ -160,6 +161,6 @@
 </main>
 
 <div class="toast" data-toast></div>
-<script src="/studio.js?v=9"></script>
+<script src="/studio.js?v=10"></script>
 </body>
 </html>

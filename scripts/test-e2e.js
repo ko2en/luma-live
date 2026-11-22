@@ -64,7 +64,7 @@ async function connect(wsUrl) {
 (async () => {
   const child = spawn(EDGE, [
     '--headless', '--disable-gpu', '--no-sandbox',
-    '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
+    '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream=fps=30',
     '--autoplay-policy=no-user-gesture-required',
     '--disable-features=WebRtcHideLocalIpsWithMdns',
     `--remote-debugging-port=${PORT}`, '--user-data-dir=C:/tmp/edge-e2e', 'about:blank'
@@ -126,6 +126,7 @@ async function connect(wsUrl) {
   await sleep(4000);
   out.hostStats = await host.evaluate(`(() => ({
     bitrate: (document.querySelector('[data-st-bitrate]') || {}).textContent,
+    sendQuality: (document.querySelector('[data-st-send]') || {}).textContent,
     viewers: (document.querySelector('[data-st-viewers]') || {}).textContent
   }))()`);
 

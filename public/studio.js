@@ -46,6 +46,7 @@
     stViewers: $('[data-st-viewers]'),
     stTime: $('[data-st-time]'),
     stRes: $('[data-st-res]'),
+    stSend: $('[data-st-send]'),
     stBitrate: $('[data-st-bitrate]'),
     share: $('[data-share-url]'),
     copy: $('[data-copy]'),
@@ -603,19 +604,23 @@
 
   async function syncPeerTracks(stream) {
     for (const [viewerId, pc] of peers) {
-      let needOffer = false;
-      for (const track of stream.getTracks()) {
-        const sender = pc.getSenders().find((s) => s.track && s.track.kind === track.kind);
-        if (!sender) {
-          try {
-            pc.addTrack(track, stream);
-            needOffer = true;
-          } catch (err) { /* noop */ }
-        } else if (sender.track !== track) {
-          try { await sender.replaceTrack(track); } catch (err) { /* noop */ }
+      await queuePeerUpdate(pc, async () => {
+        let needOffer = false;
+        for (const track of stream.getTracks()) {
+          const sender = pc.getSenders().find((s) => s.track && s.track.kind === track.kind);
+          if (!sender) {
+            try {
+              pc.addTrack(track, stream);
+              needOffer = true;
+            } catch (err) { /* noop */ }
+          } else if (sender.track !== track) {
+            try { await sender.replaceTrack(track); } catch (err) { /* noop */ }
+          }
         }
-      }
-      if (needOffer) renegotiate(viewerId, pc);
+        if (needOffer) renegotiate(viewerId, pc);
+      });
+      // 换轨后按新源实际尺寸重算，绝不修改观众共用的采集轨分辨率。
+      tunePeer(pc);
     }
   }
 
@@ -723,7 +728,7 @@
           selfBrowserSurface: 'exclude'
         });
       } catch (err) {
-        stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } }, audio: true });
       }
 
       // 系统声音原样送出去，不要做降噪/回声消除
@@ -957,23 +962,118 @@
     }
   }
 
-  function tuneSender(sender, maxBitrate) {
-    try {
-      const params = sender.getParameters();
-      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-      params.encodings[0].maxBitrate = maxBitrate || TIER_BITRATE.high;
-      params.degradationPreference = maxBitrate && maxBitrate < 1000000 ? 'balanced' : 'maintain-resolution';
-      return sender.setParameters(params).catch(() => {});
-    } catch (err) {
-      return Promise.resolve();
+  const VIDEO_LONG_EDGE = [1280, 960, 640];
+  const VIDEO_TARGET_FPS = 30;
+  const VIDEO_SWITCH_COOLDOWN = 10000;
+
+  // replaceTrack 与 get/setParameters 共用队列，避免旧 transactionId 引发
+  // InvalidModificationError；执行时才读取最新 tier，网络调档不会抹掉性能档。
+  function queuePeerUpdate(pc, update) {
+    pc.__senderUpdate = (pc.__senderUpdate || Promise.resolve()).then(async () => {
+      if (pc.signalingState !== 'closed') await update();
+    }).catch(() => {});
+    return pc.__senderUpdate;
+  }
+
+  function videoState(pc, track) {
+    if (!pc.__videoState || pc.__videoState.trackId !== track.id) {
+      pc.__videoState = {
+        trackId: track.id, step: 0, bad: 0, good: 0, switchedAt: -Infinity,
+        samples: new Map(), sources: new Map(), fps: null, resolutions: []
+      };
     }
+    return pc.__videoState;
+  }
+
+  async function tuneSender(pc, sender) {
+    const state = videoState(pc, sender.track);
+    const settings = sender.track.getSettings ? sender.track.getSettings() : {};
+    const tier = pc.__tier || 'high';
+    const index = Math.min(2, 2 - TIER_RANK[tier] + state.step);
+    const longest = Math.max(settings.width || 0, settings.height || 0);
+    const params = sender.getParameters();
+    if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+    params.encodings.forEach((encoding) => {
+      encoding.maxBitrate = TIER_BITRATE[tier];
+      encoding.maxFramerate = VIDEO_TARGET_FPS;
+      // 720p 源对应 720/540/360p，竖屏和高分屏同样按最长边处理，不放大小源。
+      encoding.scaleResolutionDownBy = Math.max(1, longest / VIDEO_LONG_EDGE[index]);
+    });
+    params.degradationPreference = 'maintain-framerate';
+    await sender.setParameters(params);
   }
 
   function tunePeer(pc) {
-    const max = TIER_BITRATE[pc.__tier || 'high'];
-    pc.getSenders().forEach((s) => {
-      if (s.track && s.track.kind === 'video') tuneSender(s, max);
+    return queuePeerUpdate(pc, async () => {
+      for (const sender of pc.getSenders()) {
+        if (sender.track && sender.track.kind === 'video') await tuneSender(pc, sender);
+      }
     });
+  }
+
+  function updateVideoStats(pc, report, now) {
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    if (!sender) return;
+    const track = sender.track;
+    const state = videoState(pc, track);
+    const sources = new Map();
+    report.forEach((r) => {
+      if (r.type !== 'media-source' || (r.kind || r.mediaType) !== 'video') return;
+      if (r.trackIdentifier && r.trackIdentifier !== track.id) return;
+      let fps = Number.isFinite(r.framesPerSecond) ? r.framesPerSecond : null;
+      const frames = Number.isFinite(r.frames) ? r.frames : r.framesCaptured;
+      const previous = state.sources.get(r.id);
+      if (previous && Number.isFinite(frames) && frames >= previous.frames && r.timestamp > previous.at) {
+        fps = (frames - previous.frames) * 1000 / (r.timestamp - previous.at);
+      }
+      if (Number.isFinite(frames)) state.sources.set(r.id, { frames, at: r.timestamp });
+      sources.set(r.id, fps);
+    });
+
+    let fps = 0;
+    let measured = false;
+    let limited = false;
+    let sourceReady = false;
+    const resolutions = new Set();
+    const samples = new Map();
+    report.forEach((r) => {
+      if (r.type !== 'outbound-rtp' || (r.kind || r.mediaType) !== 'video' || r.isRemote) return;
+      if (r.frameWidth && r.frameHeight) resolutions.add(`${r.frameWidth}×${r.frameHeight}`);
+      const previous = state.samples.get(r.id);
+      if (!Number.isFinite(r.framesEncoded)) return;
+      samples.set(r.id, { frames: r.framesEncoded, at: r.timestamp });
+      if (!previous || r.framesEncoded < previous.frames || r.timestamp <= previous.at) return;
+      // 必须用累计编码帧的增量；静态 framesPerSecond 可能陈旧，不能当作达标保证。
+      fps += (r.framesEncoded - previous.frames) * 1000 / (r.timestamp - previous.at);
+      measured = true;
+      limited = limited || r.qualityLimitationReason === 'cpu' || r.qualityLimitationReason === 'bandwidth';
+      const captureFps = sources.has(r.mediaSourceId)
+        ? sources.get(r.mediaSourceId) : (sources.size === 1 ? sources.values().next().value : null);
+      sourceReady = sourceReady || (captureFps !== null && captureFps >= 26);
+    });
+    state.samples = samples;
+    state.resolutions = Array.from(resolutions);
+    state.fps = measured ? fps : null;
+    if (!measured || !track.enabled || track.muted || track.readyState === 'ended') {
+      state.bad = 0;
+      state.good = 0;
+      return;
+    }
+
+    // 静态屏幕、低帧率摄像头或缺失采集统计时，不把源端缺帧误判为编码压力。
+    // 明确的 CPU/带宽限制仍可降档；30fps 是目标，不是设备/网络上的下限承诺。
+    const bad = limited || (fps < 26 && sourceReady);
+    state.bad = bad ? state.bad + 1 : 0;
+    state.good = fps >= 29 && !limited ? state.good + 1 : 0;
+    if (now - state.switchedAt < VIDEO_SWITCH_COOLDOWN) return;
+    const baseline = 2 - TIER_RANK[pc.__tier || 'high'];
+    if (state.bad >= 2 && baseline + state.step < 2) state.step += 1;
+    else if (state.good >= 5 && state.step > 0) state.step -= 1;
+    else return;
+    state.switchedAt = now;
+    state.bad = 0;
+    state.good = 0;
+    tunePeer(pc);
   }
 
   async function connectViewer(viewerId) {
@@ -990,8 +1090,8 @@
       try { pc.addTrack(track, localStream); } catch (err) { /* noop */ }
     });
 
-    // 抬高码率上限、优先保清晰度，避免弱协商把画面压成糊状
-    tunePeer(pc);
+    // 采集与发送均以 30fps 为目标；带宽/编码压力下优先牺牲本路分辨率。
+    await tunePeer(pc);
 
     pc.onicecandidate = (e) => {
       if (e.candidate) postSignal(viewerId, { candidate: e.candidate });
@@ -1159,45 +1259,67 @@
     return `${p(Math.floor(total / 3600))}:${p(Math.floor((total % 3600) / 60))}:${p(total % 60)}`;
   }
 
+  let statsPending = false;
   setInterval(async () => {
     el.stTime.textContent = live && startedAt ? fmt(Date.now() - startedAt) : '00:00:00';
     el.stRes.textContent = resolutionText();
 
     if (!peers.size || !live) {
       if (!live) el.stBitrate.textContent = '—';
+      if (el.stSend) el.stSend.textContent = live ? '等待观众 · 目标30 fps' : '—';
       lastBytes = null;
       return;
     }
 
-    let bytes = 0;
-    for (const pc of peers.values()) {
-      if (pc.connectionState !== 'connected') continue;
-      try {
-        const report = await pc.getStats();
-        report.forEach((r) => {
-          if (r.type === 'outbound-rtp' && r.kind === 'video' && typeof r.bytesSent === 'number') {
-            bytes += r.bytesSent;
-          }
-        });
-      } catch (err) { /* noop */ }
-    }
-
-    const now = performance.now();
-    if (lastBytes !== null && now > lastStatAt) {
-      const kbps = Math.round(((bytes - lastBytes) * 8) / ((now - lastStatAt) / 1000) / 1000);
-      let degraded = 0;
-      let relayed = 0;
+    if (statsPending) return;
+    statsPending = true;
+    try {
+      let bytes = 0;
+      const sending = [];
       for (const pc of peers.values()) {
-        if (pc.__relay) relayed += 1;
-        if (pc.__tier && pc.__tier !== 'high') degraded += 1;
+        if (pc.connectionState !== 'connected') continue;
+        try {
+          const report = await pc.getStats();
+          if (!live || !Array.from(peers.values()).includes(pc)) continue;
+          updateVideoStats(pc, report, performance.now());
+          if (pc.__videoState) sending.push(pc.__videoState);
+          report.forEach((r) => {
+            if (r.type === 'outbound-rtp' && (r.kind || r.mediaType) === 'video' && typeof r.bytesSent === 'number') {
+              bytes += r.bytesSent;
+            }
+          });
+        } catch (err) { /* noop */ }
       }
-      el.stBitrate.textContent =
-        `${kbps} kbps · ${peers.size} 路` +
-        (relayed ? ` · ${relayed} 路中继` : '') +
-        (degraded ? ` · ${degraded} 路降档` : '');
+
+      if (!live || !peers.size) return;
+      const fpsValues = sending.map((s) => s.fps).filter((fps) => fps !== null);
+      const resolutions = new Map();
+      sending.forEach((s) => s.resolutions.forEach((res) => resolutions.set(res, (resolutions.get(res) || 0) + 1)));
+      const fpsText = fpsValues.length
+        ? `${Math.round(Math.min(...fpsValues))}–${Math.round(Math.max(...fpsValues))} fps（目标30）` : '帧率采样中（目标30）';
+      if (el.stSend) {
+        el.stSend.textContent = (resolutions.size
+          ? `${Array.from(resolutions, ([res, count]) => `${res}（${count}路）`).join(' / ')} · ` : '') + fpsText;
+      }
+      const now = performance.now();
+      if (lastBytes !== null && now > lastStatAt) {
+        const kbps = Math.max(0, Math.round(((bytes - lastBytes) * 8) / ((now - lastStatAt) / 1000) / 1000));
+        let degraded = 0;
+        let relayed = 0;
+        for (const pc of peers.values()) {
+          if (pc.__relay) relayed += 1;
+          if ((pc.__tier && pc.__tier !== 'high') || (pc.__videoState && pc.__videoState.step > 0)) degraded += 1;
+        }
+        el.stBitrate.textContent =
+          `${kbps} kbps · ${peers.size} 路` +
+          (relayed ? ` · ${relayed} 路中继` : '') +
+          (degraded ? ` · ${degraded} 路降档` : '');
+      }
+      lastBytes = bytes;
+      lastStatAt = now;
+    } finally {
+      statsPending = false;
     }
-    lastBytes = bytes;
-    lastStatAt = now;
   }, 2000);
 
   /* ================= 分享链接 ================= */
