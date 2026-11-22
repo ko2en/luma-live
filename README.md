@@ -17,7 +17,7 @@
 
 <br>
 
-[工作原理](#工作原理) · [快速开始](#快速开始) · [已知限制](#已知限制)
+[工作原理](#工作原理) · [安装与部署](#安装与部署) · [已知限制](#已知限制)
 
 </div>
 
@@ -102,23 +102,133 @@ screenSource → screenGain ┘
 **3. 服务端扇出：把 O(N²) 压回 O(N)**
 观众成批涌入时，每个新人触发一次全量状态广播，就是 O(N²)。改成 200ms 合并窗口 + 一次 `flush`，同时把广播改成预构造 frame 后直接遍历连接池。2000 个连接建立时间从 **42 秒降到 1.8 秒**，单条消息扇出中位数 **11ms**。
 
-## 快速开始
+## 安装与部署
 
-```bash
-git clone https://github.com/ko2en/luma-live.git
-cd luma-live
+先说清楚一件事：**观众什么都不用装**，打开浏览器就能看。整个项目只有一台机器需要准备，就是运行 `server.js` 的那台——它负责信令、房间状态和聊天。音视频是浏览器之间直连的，不经过它。
+
+这台机器有两种选择：
+
+| | 你自己的 Windows 电脑 | 一台云服务器 |
+|---|---|---|
+| 谁能看 | 同一 Wi-Fi 的人；外网要加个穿透隧道 | 任何人，凭链接 |
+| 长期在线 | 关机/休眠就断，页面必须一直开着 | 7×24 常驻 |
+| HTTPS | 本机开播可以，对外要额外处理 | 域名 + 自动证书，一次配好 |
+| 花费 | 0 | 最低配约 ¥30/月 |
+| 适合 | 自己、同事、朋友几个人 | 要发给一批人看 |
+
+### 装到哪里
+
+其实没有「安装」这一步——就是一个文件夹里的 6 个文件。不写注册表、不装驱动、不注册系统服务、不连数据库。删掉文件夹就等于卸载干净。
+
+| 系统 | 建议位置 | 不要放 |
+|---|---|---|
+| Windows | `C:\luma-live` | 桌面、下载、`C:\Program Files`、中文或带空格的路径 |
+| Linux | `/opt/luma-live` | `/root`、`/tmp` |
+
+唯一的前置依赖是 **Node.js ≥ 18**。
+
+### 方案 A：装在自己的 Windows 电脑上
+
+1. **装 Node.js** —— 到 [nodejs.org](https://nodejs.org) 下载 LTS 的 `.msi`，一路下一步。装完打开 PowerShell 验证：`node -v`（应显示 v18 以上）
+2. **放代码** —— 新建 `C:\luma-live`，把代码放进去：装了 git 就 `git clone https://github.com/ko2en/luma-live.git C:\luma-live`，没装就点仓库右上角 **Code → Download ZIP**，解压到 `C:\luma-live`
+3. **启动** —— 在 `C:\luma-live` 目录里执行：
+
+```powershell
+cd C:\luma-live
 node server.js
 ```
 
-无需 `npm install`——整个项目零依赖。
+看到 `LUMA Live 已启动` 就成了，然后：
 
-| 地址 | 用途 |
+| 你要做的事 | 地址 |
 |---|---|
-| `http://localhost:3000/studio` | 开播控制台 |
-| `http://localhost:3000/` | 观众页 |
+| 开播 | `http://localhost:3000/studio` |
+| 同一 Wi-Fi 的观众 | `http://<你的内网IP>:3000`（`ipconfig` 查 IPv4） |
+| 不在同一网络的观众 | 见下面「内网穿透」 |
 
-> 摄像头和麦克风采集要求**安全上下文**：`localhost` 或 HTTPS。部署到服务器时记得配证书。
-> 屏幕共享的**系统声音**只有 Chrome / Edge 支持，且共享「标签页」时才会带上音频。
+首次启动 Windows 防火墙会弹窗，勾**专用网络**并允许，否则局域网里别人连不进来。
+
+**内网穿透**（不在同一 Wi-Fi 的人要看，又不想买服务器）：装 [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)，在服务启动的同时另开一个窗口执行：
+
+```powershell
+cloudflared tunnel --url http://localhost:3000
+```
+
+它会打印一个临时的 `https://xxx.trycloudflare.com` 地址，直接发给别人就能看。顺带把 HTTPS 也解决了（下面会讲为什么需要它）。
+
+### 方案 B：装到云服务器
+
+最小配置就够：**1 核 1G**，Ubuntu 22.04 或 Debian 12。因为媒体流不走服务器，带宽只要够加载页面，3–5 Mbps 就行。
+
+```bash
+# 1. 装 Node 20
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs git
+
+# 2. 代码放 /opt
+sudo mkdir -p /opt/luma-live && sudo chown "$USER":"$USER" /opt/luma-live
+git clone https://github.com/ko2en/luma-live.git /opt/luma-live
+
+# 3. 试跑
+cd /opt/luma-live && PORT=3000 node server.js
+```
+
+试通了再做成常驻服务，新建 `/etc/systemd/system/luma-live.service`：
+
+```ini
+[Unit]
+Description=LUMA Live
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/luma-live
+Environment=PORT=3000
+ExecStart=/usr/bin/node server.js
+Restart=always
+User=你的用户名
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now luma-live
+sudo systemctl status luma-live     # 看是否 active (running)
+```
+
+**配 HTTPS**：用 Caddy 最省事，证书自动申请续期。`/etc/caddy/Caddyfile`：
+
+```
+live.example.com {
+    reverse_proxy 127.0.0.1:3000 {
+        flush_interval -1
+    }
+}
+```
+
+`flush_interval -1` 这行是关键——不写的话 SSE 会被缓冲，表现是页面能打开、聊天半天不动、开播后观众一直黑屏。
+
+用 Nginx 的话，`location /` 里必须有这三行：
+
+```nginx
+proxy_http_version 1.1;
+proxy_buffering off;          # 关掉缓冲，SSE 才能实时推送
+proxy_read_timeout 3600s;     # 长连接别被默认 60s 掐断
+```
+
+最后：安全组/防火墙只放行 **80 和 443**，不要把 3000 端口暴露到公网。
+
+### 五个最容易踩的坑
+
+1. **用 `IP:3000` 打开 `/studio` 拿不到摄像头** —— 采集要求安全上下文（secure context），主播端必须是 `localhost` 或 `https://`。这是浏览器强制的，不是本项目的问题。
+2. **反向代理忘了关缓冲** —— 页面正常但聊天不动、观众黑屏，八成是这行漏了。
+3. **把 3000 直接暴露公网** —— 既没有 TLS 也没必要，统一经 80/443 转发。
+4. **电脑休眠/关盖** —— 服务挂了直播就断。服务端状态全在内存，不落盘，重启即清空。
+5. **以为人多了要加 CPU** —— 真正的瓶颈是主播的上行带宽和并发连接数，不是 CPU；1 核机器跑信令毫无压力。
+
+> 补充：摄像头/麦克风采集要求**安全上下文**，`localhost` 或 HTTPS 都算；屏幕共享的**系统声音**只有 Chrome / Edge 支持，且共享「标签页」时才带音频。
+
 
 观众打开后看到的是这样——左侧播放器，右侧实时聊天，手机浏览器自动切成单列：
 
