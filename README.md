@@ -1,39 +1,61 @@
 <div align="center">
 
+<img src="https://raw.githubusercontent.com/ko2en/luma-live/main/docs/luma-live-banner.svg" alt="LUMA Live — Browser-native live streaming" width="100%">
+
 # LUMA Live
 
-**轻量、浏览器原生的实时直播间**
+### Your browser. Your stream. Your audience.
 
-不需要 OBS、RTMP 或转码服务：打开浏览器即可开播，把链接分享给观众。
+**浏览器原生的轻量实时直播**
+
+从摄像头到观众，只需一个浏览器和一个分享链接。
+无需 OBS、RTMP 推流器或媒体转码服务器。
 
 <p>
-  <a href="https://github.com/ko2en/luma-live/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-2563eb" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/Node.js-%E2%89%A518-339933?logo=nodedotjs&logoColor=white" alt="Node.js 18+">
-  <img src="https://img.shields.io/badge/dependencies-0-16a34a" alt="Zero runtime dependencies">
-  <img src="https://img.shields.io/badge/WebRTC-TURN%20relay-7c3aed?logo=webrtc&logoColor=white" alt="WebRTC TURN relay">
+  <a href="https://github.com/ko2en/luma-live/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ko2en/luma-live?style=flat-square&label=license" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/Node.js-%E2%89%A518-43853D?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js 18+">
+  <img src="https://img.shields.io/badge/runtime%20dependencies-0-2563EB?style=flat-square" alt="Zero runtime dependencies">
+  <img src="https://img.shields.io/badge/media-WebRTC%20%2B%20TURN-7C3AED?style=flat-square&logo=webrtc&logoColor=white" alt="WebRTC and TURN">
 </p>
 
-[快速开始](#快速开始) · [一键配置 TURN](#一键配置-turn) · [核心能力](#核心能力) · [工作原理](#工作原理) · [配置](#配置) · [验证](#验证) · [路线图](#路线图)
+[快速开始](#快速开始) · [部署 TURN](#部署-turn) · [产品能力](#产品能力) · [架构](#架构) · [配置参考](#配置参考) · [路线图](#路线图)
 
 </div>
 
-> [!IMPORTANT]
-> LUMA Live 面向小范围分享，不是大规模直播平台。主播会为**每位观众分别发送一份媒体流**，实际承载能力取决于主播上行、设备、网络和 TURN 中继带宽。
+<br>
 
-## 一句话介绍
+> **产品定位**　LUMA Live 为小范围、低门槛实时分享而设计。当前采用主播逐观众发送媒体的 P2P 拓扑，**不是面向大规模观众的直播 CDN / SFU**。实际并发取决于主播上行、终端编码能力、网络与 TURN 带宽。
 
-LUMA Live 是一个 Node.js + WebRTC 的轻量直播项目：主播在浏览器中采集摄像头、麦克风或屏幕，观众用浏览器观看并聊天；Node.js 服务端负责登录、房间状态、信令和 ICE 配置，媒体通过自建 TURN 中继传输。
+## 为什么是 LUMA Live
 
-## 核心能力
+把直播链路尽量留在浏览器里：主播负责采集和发送，观众直接观看；轻量服务端只做登录、房间状态、聊天与 WebRTC 信令。
 
-- **浏览器直接开播**：摄像头、麦克风、屏幕共享与 WebAudio 混音。
-- **链接观看**：观众无需安装客户端，浏览器即可播放和聊天。
-- **强制 TURN 中继**：媒体不建立浏览器直连，也不静默回退到直连。
-- **单主播保护**：同一账号只允许一处开播，接管过程有明确提示。
-- **账号与会话**：首次启动从 `AUTH_USERS` 写入账号库，支持网页登录、自助改密和头像。
-- **轻量信令**：使用 SSE + HTTP POST 处理信令、房间、聊天和断线宽限。
-- **固定发送档位**：统一以 1280×720、30 fps、最高 1.2 Mbps 向每位观众发送。
-- **零第三方运行时依赖**：服务端使用 Node.js 内置能力，适合自托管和快速试用。
+| **01 · 直接开播** | **02 · 浏览器观看** | **03 · 自托管** |
+|:---|:---|:---|
+| 摄像头、麦克风、屏幕共享与 WebAudio 混音 | 分享网页即可观看和实时聊天 | 单 Node.js 进程；无第三方运行时依赖 |
+| 不需要 OBS 或 RTMP 推流器 | 无需安装专用客户端 | TURN 凭证由服务端按需签发 |
+
+## 产品能力
+
+<details open>
+<summary><strong>直播工作流</strong></summary>
+
+- 浏览器采集摄像头、麦克风、屏幕共享音视频，并通过 WebAudio 混音。
+- 主播可创建直播，观众通过浏览器观看、聊天。
+- 固定发送档位为 1280×720、30 fps，视频码率上限 1.2 Mbps；这些是目标参数，不是性能保证。
+- 单主播保护、会话接管提示，以及主播信令短暂断线后的 10 秒重连宽限。
+
+</details>
+
+<details>
+<summary><strong>连接与安全边界</strong></summary>
+
+- SSE + HTTP POST 承载房间事件与 WebRTC 信令；媒体不经过 Node.js 应用服务器。
+- 媒体强制经配置的 TURN 中继，不静默退回浏览器直连。
+- 支持账号登录、HttpOnly cookie、登录失败限速、自助改密与头像。
+- TURN 使用 coturn REST 方式签发限时凭证，共享密钥保留在服务端。
+
+</details>
 
 ## 快速开始
 
@@ -76,11 +98,9 @@ docker run --rm -p 3000:3000 \
   luma-live
 ```
 
-## 一键配置 TURN
+## 部署 TURN
 
-跨网络观看需要 TURN 中继。项目提供了面向 Ubuntu / Debian 新手的脚本：它会安装 coturn、生成随机共享密钥、写入配置、启动服务，并生成 LUMA Live 可直接使用的 `TURN_LINES`。
-
-在一台**独立的公网 Ubuntu / Debian 服务器**上执行：
+> **需要跨网络观看？** 在公网 Ubuntu / Debian 服务器运行下面的命令，脚本会安装 coturn、生成随机共享密钥并准备 LUMA Live 配置。
 
 ```bash
 git clone https://github.com/ko2en/luma-live.git
@@ -88,25 +108,20 @@ cd luma-live
 sudo bash scripts/setup-turn.sh turn.example.com
 ```
 
-如果没有域名，也可以直接填写公网 IP：
+没有域名时，可将 `turn.example.com` 替换为服务器公网 IP。执行前先在云厂商控制台创建 Ubuntu / Debian 服务器，并确保自己有 SSH 和 sudo 权限。
 
 ```bash
-sudo bash scripts/setup-turn.sh 203.0.113.10
-```
-
-脚本完成后，将输出的环境文件复制到运行 LUMA Live 的机器（或直接在同一台机器执行）：
-
-```bash
+# 如果 LUMA Live 与 TURN 在同一台服务器
 set -a
 source /etc/luma-live/turn.env
 set +a
 node server.js
 ```
 
-> [!WARNING]
-> 脚本只自动配置服务器本机的 `ufw`。如果服务器使用云厂商安全组，还必须手动放行 TURN 端口（默认 TCP/UDP `3478`、TCP/UDP `5349`）和 UDP `49152-65535`。不要把 `/etc/luma-live/turn-secret` 或 `/etc/luma-live/turn.env` 提交到 Git。
+如果 LUMA Live 运行在另一台机器，将 `/etc/luma-live/turn.env` 安全传到该机器后再 `source`。该文件包含 TURN 密钥，传输时应使用 SSH/SCP 等安全方式，限制文件读取权限，并且**绝不要提交到 Git 或公开粘贴**。
 
-脚本当前支持 Ubuntu / Debian + systemd + coturn；其他发行版请参考 `turnserver.conf` 的同等配置手动部署。
+> [!WARNING]
+> 脚本只自动配置服务器本机启用状态下的 `ufw`。云厂商安全组仍需手动放行 TCP/UDP `3478`、TCP/UDP `5349` 和 UDP `49152-65535`。脚本面向 Ubuntu / Debian + systemd，不会自动购买云服务器、配置域名 / TLS 证书或修改云安全组。正式公网部署请先验证防火墙与 TURN 连通性。
 
 ### 部署前必读
 
@@ -124,7 +139,7 @@ node server.js
 
 窄屏观众页会从播放器 + 聊天双栏切换为单列布局。
 
-## 工作原理
+## 架构
 
 ```mermaid
 flowchart LR
@@ -144,7 +159,7 @@ flowchart LR
 - **账号安全**：登录 cookie 为 HttpOnly；失败次数按来源 IP 限制，连续失败达到阈值后暂时锁定。
 - **重连与接管**：主播信令断开后进入宽限期；新开播台接管时，旧页面收到 `host-taken` 后停止推流和自动重连。
 
-## 与 Owncast 的定位区别
+## 设计取舍
 
 项目灵感来自 [Owncast](https://github.com/owncast/owncast)，但两者媒体路径不同：
 
@@ -155,7 +170,7 @@ flowchart LR
 | 主要容量约束 | 主播上行、设备、连接数与中继带宽 | 服务端处理与分发资源 |
 | 适用场景 | 小范围、低部署成本的实时分享 | 需要服务端媒体分发的直播场景 |
 
-## 配置
+## 配置参考
 
 全部通过环境变量控制。公网部署至少设置 `AUTH_USERS`（或兼容旧部署的 `STREAM_KEY`）和 `TURN_LINES`。
 
@@ -184,7 +199,7 @@ TURN_LINES="hk|turn.example.com|23478|secret|香港"
 
 > `TRUST_PROXY=1` 只能用于可信反向代理之后。否则客户端可能伪造来源 IP，影响登录限速与审计。
 
-## 验证
+## 测试
 
 ```bash
 npm test              # API 回归：认证、限速、信令、聊天、重连与 ICE
@@ -194,17 +209,19 @@ npm run test:e2e      # 开播、观看、刷新重连
 npm run test:studio   # 开播口令流程
 ```
 
-测试通过只代表对应场景通过，不等于完成跨浏览器、跨网络或生产容量验证。
+> 测试通过仅表示相应自动化场景通过，不等价于跨浏览器、跨网络或生产容量认证。
 
-## 已知限制
+## 运行边界
 
-- 主播为每位观众单独发送媒体，主播上行和设备编码能力是主要瓶颈。
-- TURN 中继需要独立服务器带宽，且可能被特定网络策略阻断。
-- 房间与连接状态保存在内存中，服务重启后需要重新开播。
-- 当前没有录像回看、逐观众自适应码率或 SFU 分发模式。
-- SSE 凭证、共享设备本地存储和公网防护仍值得进一步加固。
+| 当前设计 | 实际影响 |
+|:---|:---|
+| 主播为每位观众分别发送媒体 | 上行带宽与浏览器编码能力随观众数增加 |
+| 强制走 TURN 中继 | 需承担独立中继带宽；网络策略也可能阻断中继 |
+| 房间状态保存在内存 | 服务重启后需要重新建立直播 |
+| 固定发送档位 | 当前没有逐观众自适应码率 |
+| 暂无媒体录制与 SFU | 不提供回放，不适合大规模分发 |
 
-如果目标是大规模观看，建议评估 mediasoup、LiveKit 等 SFU，或完整的服务端媒体分发架构，而不是只提高信令服务配置。
+若目标是大规模观看，应评估 mediasoup、LiveKit 等 SFU 或服务端媒体分发方案，而非只提高信令服务配置。公网运行前也应评估 SSE 凭证、共享设备本地存储和反向代理防护。
 
 ## 目录结构
 

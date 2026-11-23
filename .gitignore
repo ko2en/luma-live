@@ -6,6 +6,8 @@ node_modules/
 .env
 *.env.local
 turn.env
+*.secret
+turn-secret
 .DS_Store
 Thumbs.db
 

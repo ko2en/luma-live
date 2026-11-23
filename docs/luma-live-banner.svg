@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="340" viewBox="0 0 1200 340" role="img" aria-labelledby="title desc">
+  <title id="title">LUMA Live</title>
+  <desc id="desc">A browser-native live streaming project, with live signal paths between a host, a relay, and viewers.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071521"/>
+      <stop offset="1" stop-color="#102b3a"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5ce1c2" stop-opacity=".1"/>
+      <stop offset=".5" stop-color="#5ce1c2" stop-opacity=".9"/>
+      <stop offset="1" stop-color="#83b8ff" stop-opacity=".4"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1200" height="340" rx="24" fill="url(#bg)"/>
+  <circle cx="1010" cy="58" r="160" fill="#173c4c" opacity=".28"/>
+  <circle cx="1110" cy="290" r="210" fill="#172c49" opacity=".34"/>
+  <path d="M0 278 C220 208 320 330 520 260 S860 200 1200 262" fill="none" stroke="#254b57" stroke-width="1" opacity=".8"/>
+  <path d="M0 300 C220 230 340 345 550 275 S900 218 1200 280" fill="none" stroke="#254b57" stroke-width="1" opacity=".55"/>
+  <g font-family="Inter,Segoe UI,Arial,sans-serif">
+    <text x="70" y="74" fill="#82e8d0" font-size="14" font-weight="700" letter-spacing="3">BROWSER-NATIVE LIVE STREAMING</text>
+    <text x="66" y="157" fill="#f3f8fc" font-size="66" font-weight="750" letter-spacing="-2">LUMA <tspan fill="#5ce1c2">LIVE</tspan></text>
+    <text x="70" y="199" fill="#c5d5df" font-size="21">Your browser. Your stream. Your audience.</text>
+    <text x="70" y="236" fill="#89a7b6" font-size="15">WebRTC media · lightweight signaling · self-hosted TURN relay</text>
+  </g>
+  <g transform="translate(760 94)">
+    <path d="M94 73 C164 28 216 28 276 73" fill="none" stroke="url(#beam)" stroke-width="3" stroke-dasharray="7 9"/>
+    <path d="M94 86 C164 132 216 132 276 86" fill="none" stroke="#567e91" stroke-width="2" stroke-dasharray="5 8"/>
+    <path d="M94 73 C164 28 216 28 276 73" fill="none" stroke="#5ce1c2" stroke-width="8" opacity=".16" filter="url(#glow)"/>
+    <g transform="translate(0 46)">
+      <rect width="112" height="82" rx="15" fill="#123344" stroke="#4d8595"/>
+      <circle cx="56" cy="29" r="10" fill="#5ce1c2"/>
+      <path d="M36 60 Q56 39 76 60" fill="none" stroke="#b4e5e1" stroke-width="5" stroke-linecap="round"/>
+      <text x="56" y="104" text-anchor="middle" fill="#c8dce5" font-size="12">HOST</text>
+    </g>
+    <g transform="translate(138 0)">
+      <rect width="112" height="82" rx="15" fill="#1c3046" stroke="#5978a7"/>
+      <path d="M56 18 L72 31 L66 51 L46 51 L40 31 Z" fill="none" stroke="#91b9ff" stroke-width="3"/>
+      <circle cx="56" cy="35" r="5" fill="#91b9ff"/>
+      <text x="56" y="104" text-anchor="middle" fill="#c8dce5" font-size="12">TURN RELAY</text>
+    </g>
+    <g transform="translate(276 46)">
+      <rect width="112" height="82" rx="15" fill="#123344" stroke="#4d8595"/>
+      <circle cx="43" cy="29" r="8" fill="#83b8ff"/><circle cx="69" cy="29" r="8" fill="#5ce1c2"/>
+      <path d="M27 60 Q43 40 57 60 M51 60 Q69 40 85 60" fill="none" stroke="#b4e5e1" stroke-width="4" stroke-linecap="round"/>
+      <text x="56" y="104" text-anchor="middle" fill="#c8dce5" font-size="12">VIEWERS</text>
+    </g>
+    <circle cx="94" cy="73" r="5" fill="#5ce1c2"/><circle cx="370" cy="73" r="5" fill="#83b8ff"/>
+  </g>
+  <text x="1128" y="314" text-anchor="end" fill="#5e7e8d" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="11" letter-spacing="2">OPEN SOURCE · SELF-HOSTED</text>
+</svg>
