@@ -45,6 +45,8 @@
 - 主播可创建直播，观众通过浏览器观看、聊天。
 - 固定发送档位为 1280×720、30 fps，视频码率上限 1.2 Mbps；这些是目标参数，不是性能保证。
 - 单主播保护、会话接管提示，以及主播信令短暂断线后的 10 秒重连宽限。
+- 摄像头热切换：切换设备时替换发送轨，不重建连接，观众端不中断。
+- 网页内连接诊断：不用先开播，逐项检查凭证、线路、中继候选、UDP/TCP 与握手耗时。
 
 </details>
 
@@ -55,6 +57,8 @@
 - 媒体强制经配置的 TURN 中继，不静默退回浏览器直连。
 - 支持账号登录、HttpOnly cookie、登录失败限速、自助改密与头像。
 - TURN 使用 coturn REST 方式签发限时凭证，共享密钥保留在服务端。
+- 开播口令不进 URL：先用 `POST /api/sse-ticket` 换 60 秒一次性票据，再拼进 SSE query。
+- CSP / Permissions-Policy / COOP / CORP 等安全响应头，写接口校验 Origin/Referer。
 
 </details>
 
@@ -67,6 +71,9 @@
 3. 如果没有 Node.js，按提示安装 **Node.js LTS（≥18）** 后重新运行。
 4. 打开 <http://localhost:3000/login> 登录，再进入开播台并授权摄像头、麦克风。
 5. 局域网观众可访问 `http://<运行服务的内网IP>:3000/`。
+
+`AUTH_USERS` 只在首次启动时作为种子写入 `data/users.json`，之后账号以文件为准 ——
+改环境变量不会覆盖已有账号。真要上公网别走这套手动流程，直接用下面的[部署方式](#部署方式)。
 
 也可以在项目目录执行：
 
@@ -158,11 +165,11 @@ node server.js
 
 ## 界面预览
 
-| 开播控制台 | 观众页 |
-| --- | --- |
-| ![开播控制台](docs/studio.png) | ![观众页](docs/viewer.png) |
+| 登录页 | 开播控制台 | 观众页 |
+| --- | --- | --- |
+| ![登录页](docs/login.png) | ![开播控制台](docs/studio.png) | ![观众页](docs/viewer.png) |
 
-窄屏观众页会从播放器 + 聊天双栏切换为单列布局。
+窄屏观众页会从播放器 + 聊天双栏切换为单列布局；开播台的摄像头与麦克风来源都能在开播过程中切换。
 
 ## 架构
 
@@ -239,6 +246,14 @@ npm run doctor        # 部署自检：Node 版本、数据目录、账号、TUR
 node scripts/hash-pass.js '密码'   # 生成可写进 AUTH_USERS 的 scrypt 摘要
 ```
 
+以上命令由 CI（`.github/workflows/ci.yml`）在每次推送时执行，另外还会跑 JS / shell 语法检查、
+脚本可执行位检查与 `npm run doctor`：
+
+```bash
+for f in server.js src/*.js scripts/*.js; do node --check "$f"; done
+for f in scripts/*.sh start.sh; do bash -n "$f"; done
+```
+
 > 测试通过仅表示相应自动化场景通过，不等价于跨浏览器、跨网络或生产容量认证。
 
 部署后可以先跑一次 `npm run doctor` 再开播；TURN 那边有对应的只读自检：
@@ -275,8 +290,10 @@ src/
   turn.js               TURN 线路与 REST 凭证现签
   util.js               定时安全比较
 public/                 登录页、观众页、开播台与前端逻辑
-scripts/                API / 浏览器回归测试、TURN 部署与自检、密码摘要工具
+scripts/                回归测试、deploy.sh（一键部署）、setup-turn.sh、hash-pass.js
 deploy/                 Caddyfile、nginx.conf、systemd 模板
+.github/workflows/      CI：语法检查、API 回归、部署自检
+CHANGELOG.md            版本变更与升级注意事项
 start.bat / start.sh    Windows / macOS / Linux 启动入口
 Dockerfile              容器构建配置
 docs/                   README 截图与横幅
@@ -292,11 +309,16 @@ data/                   运行时生成的账号库与头像（不入库）
 - [x] TURN 凭证下发与中继识别
 - [x] 强制中继的固定发送参数
 - [x] 公网 TURN 中继链路实测
-- [ ] 逐观众自适应码率
 - [x] SSE 使用短期票据取代 query 中的凭证
+- [x] 密码升级到 scrypt + 旧格式透明迁移
+- [x] 网页内 TURN / WebRTC 连接诊断
+- [x] 摄像头热切换（replaceTrack，不重建连接）
+- [x] Ubuntu / Debian 一键部署：同机 / 拆分两种拓扑
+- [x] 健康检查、部署自检与 CI
+- [ ] 设备管理面板（音频输出、断线自动恢复）
 - [ ] 录像与回看
 - [ ] 可选 SFU 模式
-- [x] Ubuntu / Debian 一键配置 TURN 脚本
+- [ ] 逐观众自适应码率（暂不计划：固定档位是主动取舍，反复调档容易带来画面抖动）
 
 ## 贡献与反馈
 
