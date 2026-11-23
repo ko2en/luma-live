@@ -66,8 +66,8 @@ chmod 0640 "${TURN_CONF}"
 cat > "${LUMA_ENV}" <<EOF
 # Source this file when starting LUMA Live.
 # TURN_LINES format: id|host|port|secret|title
-TURN_LINES=main|${TURN_HOST}|${TURN_PORT}|${TURN_SECRET}|${TURN_TITLE}
-TURN_DEFAULT=main
+TURN_LINES="main|${TURN_HOST}|${TURN_PORT}|${TURN_SECRET}|${TURN_TITLE}"
+TURN_DEFAULT="main"
 EOF
 chmod 0640 "${LUMA_ENV}"
 
