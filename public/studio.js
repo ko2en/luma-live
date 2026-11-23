@@ -879,7 +879,11 @@
     }).join('');
   }
 
+  let diagRunning = false;
+
   async function runTurnCheck() {
+    if (diagRunning) return; /* 连点只跑一次：每次都要建 PC、收候选，代价不小 */
+    diagRunning = true;
     if (el.turnTest) el.turnTest.disabled = true;
     const rows = [];
     const set = (k, state, v) => {
@@ -898,12 +902,15 @@
         ice = (await res.json()).ice || {};
       } catch (err) {
         set('读取凭证', 'bad', '接口不可用');
+        set('下一步', 'bad', '确认已登录、服务在跑，然后刷新页面重试');
         return;
       }
 
       const servers = ice.iceServers || [];
       if (!servers.length) {
         set('读取凭证', 'bad', '服务端没有配置 TURN');
+        set('下一步', 'bad', '在 TURN 机上跑 scripts/setup-turn.sh');
+        set('再一步', 'bad', '把输出的 TURN_LINES 写进 /etc/luma-live.env 后重启服务');
         return;
       }
       const hours = Math.round((Number(ice.ttl) || 0) / 3600);
@@ -933,6 +940,8 @@
         await pc.setLocalDescription(await pc.createOffer());
         await finished;
       } finally {
+        pc.onicecandidate = null;
+        pc.onicegatheringstatechange = null;
         try { pc.close(); } catch (err) { /* noop */ }
       }
 
@@ -944,10 +953,14 @@
       if (!relay.length) {
         set('收集中继候选', 'bad', '无中继候选');
         set('可能原因', 'bad', 'TURN 不可达 / 凭证无效 / 网络拦截');
+        set('先查端口', 'bad', '安全组与防火墙放行 UDP 3478 和 49152-65535');
+        set('再查服务', 'bad', 'systemctl status coturn；bash scripts/setup-turn.sh --check');
+        set('查不实则看密钥', 'bad', 'TURN_LINES 的 secret 要与 /etc/luma-live/turn-secret 一致');
         return;
       }
       set('收集中继候选', 'ok', `${relay.length} 个${addr ? ` · ${addr}` : ''}`);
       set('UDP 通道', udp.length ? 'ok' : 'bad', udp.length ? `${udp.length} 个` : '无');
+      if (!udp.length) set('UDP 建议', 'bad', '放行 UDP 3478 与 49152-65535；只放 TCP 时延迟会明显变差');
       /* 浏览器一般只收集它最想用的那种传输：UDP 通了就不会再试 TCP。
          所以没收集到 TCP 不算故障，只有两者都没有才是真的连不上。 */
       set('TCP 通道', tcp.length ? 'ok' : 'wait',
@@ -957,6 +970,7 @@
       set('诊断中断', 'bad', String(err && err.message ? err.message : err));
     } finally {
       if (el.turnTest) el.turnTest.disabled = false;
+      diagRunning = false;
     }
   }
 

@@ -37,6 +37,37 @@ need_apt() {
   command -v apt-get >/dev/null 2>&1 || die "当前脚本只支持 Debian / Ubuntu（需要 apt-get）"
 }
 
+# 输入一律当不可信：这些值会被拼进环境文件，一个换行就能造出多余变量
+valid_host() {
+  local h="$1"
+  [[ -n "${h}" ]] || die "主机不能为空"
+  [[ "${h}" =~ ^[A-Za-z0-9.-]{1,253}$ ]] || die "主机只能是 IP 或域名（字母数字点连字符），不要带端口或路径"
+}
+
+valid_port() {
+  local p="$1"
+  [[ "${p}" =~ ^[0-9]{1,5}$ ]] || die "端口必须是数字"
+  (( p >= 1 && p <= 65535 )) || die "端口必须在 1–65535"
+}
+
+valid_user_name() {
+  local u="$1"
+  [[ "${u}" =~ ^[^:[:space:]]{2,24}$ ]] || die "账号名 2–24 位，不能含冒号或空白"
+}
+
+valid_turn_lines() {
+  local v="$1"
+  [[ -n "${v}" ]] || die "TURN_LINES 不能为空"
+  [[ "${v}" != *$'\n'* ]] || die "TURN_LINES 不能包含换行"
+  [[ "${v}" != *'"'* && "${v}" != *'\\'* ]] || die "TURN_LINES 不能包含引号或反斜杠"
+  local id host port secret title extra
+  IFS='|' read -r id host port secret title extra <<< "${v}"
+  [[ -n "${id}" && -n "${host}" && -n "${port}" ]] || die "TURN_LINES 格式应为 id|host|port|secret|标题"
+  [[ -z "${extra:-}" ]] || die "当前只支持单条线路（不要用逗号拼多条）"
+  valid_host "${host}"
+  valid_port "${port}"
+}
+
 # 有 openssl 用 openssl，没有就用 node 兜底，避免为了一个随机串再装包
 rand_hex() {
   local bytes="${1:-32}"
@@ -90,6 +121,7 @@ ensure_user() {
 
 copy_app() {
   [[ -f "${REPO_DIR}/server.js" ]] || die "请在仓库目录内运行（找不到 server.js）"
+  [[ "${APP_DIR}" == "/opt/luma-live" ]] || die "APP_DIR 被改成 ${APP_DIR}，拒绝执行（脚本只允许写 /opt/luma-live）"
   install -d -m 0755 "${APP_DIR}"
   # 只同步运行需要的文件，别把 data/、.git/、备份一起搬过去
   for item in server.js package.json src public scripts start.sh; do
@@ -137,9 +169,28 @@ ensure_admin() {
     [[ ${#pass} -ge 8 ]] && break
     warn "至少 8 位"
   done
-  printf 'AUTH_USERS=%s:%s\n' "${user}" "${pass}" >> "${ENV_FILE}"
+  valid_user_name "${user}"
+
+  # 环境文件里只放 scrypt 摘要，明文密码不落盘
+  local hash
+  hash="$(node "${REPO_DIR}/scripts/hash-pass.js" "${pass}" 2>/dev/null || true)"
+  [[ -n "${hash}" ]] || die "生成密码摘要失败（需要 Node.js ≥ 18）"
+  if grep -q '^AUTH_USERS=' "${ENV_FILE}"; then
+    sed -i "s|^AUTH_USERS=.*|AUTH_USERS=${user}:${hash}|" "${ENV_FILE}"
+  else
+    printf 'AUTH_USERS=%s:%s\n' "${user}" "${hash}" >> "${ENV_FILE}"
+  fi
   chmod 600 "${ENV_FILE}"
-  ok "已写入初始账号 ${user}"
+  ok "已写入初始账号 ${user}（AUTH_USERS 只存 scrypt 摘要）"
+}
+
+# 首次启动会把种子写进 users.json；之后环境文件里就不该再有明文种子了
+drop_seed_after_boot() {
+  [[ -s "${APP_DIR}/data/users.json" ]] || return 0
+  grep -q '^AUTH_USERS=' "${ENV_FILE}" || return 0
+  sed -i '/^AUTH_USERS=/d' "${ENV_FILE}"
+  chmod 600 "${ENV_FILE}"
+  ok "账号已落到 data/users.json，AUTH_USERS 已从 ${ENV_FILE} 移除"
 }
 
 set_env_line() {
@@ -206,6 +257,7 @@ do_app() {
   set_env_line COOKIE_SECURE 0
   set_env_line TRUST_PROXY 1
   if [[ -n "${turn_lines}" ]]; then
+    valid_turn_lines "${turn_lines}"
     set_env_line TURN_LINES "\"${turn_lines}\""
     ok "已写入 TURN_LINES"
   elif grep -q '^TURN_LINES=' "${ENV_FILE}"; then
@@ -217,6 +269,7 @@ do_app() {
 
   copy_app
   install_unit
+  drop_seed_after_boot
 
   say "部署完成"
   echo "  登录页   http://<本机IP>:3000/login"
@@ -273,11 +326,13 @@ main() {
     all-in-one)
       need_root
       [[ -n "${2:-}" ]] || die "用法：deploy.sh all-in-one <公网IP或域名>"
+      valid_host "$2"
       do_all_in_one "$2"
       ;;
     turn)
       need_root
       [[ -n "${2:-}" ]] || die "用法：deploy.sh turn <公网IP或域名>"
+      valid_host "$2"
       do_turn "$2"
       ;;
     app)

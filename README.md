@@ -16,9 +16,10 @@
   <img src="https://img.shields.io/badge/Node.js-%E2%89%A518-43853D?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js 18+">
   <img src="https://img.shields.io/badge/runtime%20dependencies-0-2563EB?style=flat-square" alt="Zero runtime dependencies">
   <img src="https://img.shields.io/badge/media-WebRTC%20%2B%20TURN-7C3AED?style=flat-square&logo=webrtc&logoColor=white" alt="WebRTC and TURN">
+  <a href="https://github.com/ko2en/luma-live/actions/workflows/ci.yml"><img src="https://github.com/ko2en/luma-live/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 
-[快速开始](#快速开始) · [部署 TURN](#部署-turn) · [产品能力](#产品能力) · [架构](#架构) · [配置参考](#配置参考) · [路线图](#路线图)
+[快速开始](#快速开始) · [部署方式](#部署方式) · [部署 TURN](#部署-turn) · [产品能力](#产品能力) · [架构](#架构) · [配置参考](#配置参考) · [更新日志](CHANGELOG.md)
 
 </div>
 
@@ -118,6 +119,9 @@ bash scripts/deploy.sh status
 `all-in-one` 与 `turn` 内部会调用 `scripts/setup-turn.sh`，不会重复装 coturn。
 `app` 模式只装依赖、同步代码、写 `/etc/luma-live.env`、注册 systemd 服务，不碰 TURN。
 三种模式都是幂等的：重复执行只会覆盖代码与配置，不会重置已有账号库。
+
+`app` 模式在首次启动、`data/users.json` 生成之后，会把 `AUTH_USERS` 从
+`/etc/luma-live.env` 里删掉 —— 账号从此以文件为唯一真相，环境文件不再留种子。
 
 ## 部署 TURN
 

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 语法检查（JS）
+        run: |
+          for f in server.js src/*.js scripts/*.js; do
+            node --check "$f"
+          done
+
+      - name: 语法检查（shell）
+        run: |
+          for f in scripts/*.sh start.sh; do
+            bash -n "$f"
+          done
+
+      - name: 可执行位
+        run: |
+          test -x scripts/deploy.sh
+          test -x scripts/setup-turn.sh
+
+      - name: API 回归
+        run: npm test
+
+      - name: 部署自检
+        env:
+          AUTH_USERS: ci:Kq7-Luma-2026
+          TURN_LINES: 'ci|127.0.0.1|3478|ci-secret|CI'
+        run: npm run doctor

@@ -62,7 +62,10 @@ if (hasAccounts) {
 } else if (seed) {
   pass('AUTH_USERS 已配置（首次启动会写入 users.json）');
   if (!/^[^:,\s]+:.+/.test(seed)) soft('AUTH_USERS 格式看起来不对，应为 用户名:密码[,用户名:密码]');
-  if (seed.includes('请替换') || seed.includes('changeme') || seed.includes('password')) {
+  /* 只认“整段就是示例密码”的情况：真实密码里含 password 这种词不该被误判 */
+  const seedPass = seed.slice(seed.indexOf(':') + 1).trim();
+  const samples = new Set(['password', 'passwd', 'changeme', '123456', '12345678', 'admin', 'demo', 'test']);
+  if (seed.includes('请替换') || samples.has(seedPass.toLowerCase())) {
     bad('AUTH_USERS 里还是示例密码，公网部署前务必改成强密码');
   }
 } else {
