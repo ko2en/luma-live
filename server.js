@@ -544,6 +544,12 @@ async function handleApi(req, res, url) {
     });
   }
 
+  /* 连接诊断用：现签一份 ICE 配置给前端自己做候选收集。
+     浏览器只能从「能不能拿到 relay 候选」判断中继是否可用，服务端不参与探测。 */
+  if (req.method === 'GET' && route === '/api/ice') {
+    return json(res, 200, { ice: icePayload(), now: Date.now() });
+  }
+
   /* 开播端在重连之前先问一句：我这个 id 是不是已经被顶替了？
      EventSource 拿不到 403 的响应体，只能靠这个接口判断「是不是该安静退场」，
      不然被踢的页面会一直自动重连，和当前主播互相踢。 */

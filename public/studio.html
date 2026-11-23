@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://registry.npmmirror.com" crossorigin>
 <link rel="stylesheet" href="https://registry.npmmirror.com/lxgw-wenkai-webfont/1.7.0/files/lxgwwenkai-regular.css">
 <link rel="stylesheet" href="https://registry.npmmirror.com/lxgw-wenkai-webfont/1.7.0/files/lxgwwenkai-bold.css">
-<link rel="stylesheet" href="/styles.css?v=24" />
+<link rel="stylesheet" href="/styles.css?v=25" />
 </head>
 <body>
 <div class="ambient"></div>
@@ -100,6 +100,14 @@
 
       <div class="media-grid">
         <label class="media-field">
+          <span class="field-label">摄像头来源</span>
+          <span class="select-wrap">
+            <select class="select" data-cam-select aria-label="选择摄像头"></select>
+            <svg class="select-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>
+          </span>
+        </label>
+
+        <label class="media-field">
           <span class="field-label">麦克风来源</span>
           <span class="select-wrap">
             <select class="select" data-mic-select aria-label="选择麦克风"></select>
@@ -152,6 +160,13 @@
     </div>
 
     <div class="side-card">
+      <h3>连接诊断</h3>
+      <button class="diag-btn" data-turn-test type="button">测试 TURN 连接</button>
+      <ul class="diag-list" data-turn-report hidden></ul>
+      <p class="diag-hint">在浏览器里真实收集一次中继候选，判断 TURN 是否可达；不需要先开播。</p>
+    </div>
+
+    <div class="side-card">
       <h3>开播须知</h3>
       <ul class="tips">
         <li>首次开播浏览器会分别询问摄像头和麦克风权限，都要选「允许」。</li>
@@ -164,7 +179,7 @@
 </main>
 
 <div class="toast" data-toast></div>
-<script src="/studio.js?v=27"></script>
+<script src="/studio.js?v=28"></script>
 <script src="/auth-ui.js?v=2"></script>
 </body>
 </html>

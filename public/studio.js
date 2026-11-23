@@ -49,6 +49,9 @@
     btnMic: $('[data-btn-mic]'),
     dotMic: $('[data-dot-mic]'),
     micSelect: $('[data-mic-select]'),
+    camSelect: $('[data-cam-select]'),
+    turnTest: $('[data-turn-test]'),
+    turnReport: $('[data-turn-report]'),
     vuState: $('[data-vu-state]'),
     mediaNote: $('[data-media-note]'),
     stAudio: $('[data-st-audio]'),
@@ -164,6 +167,8 @@
   let screenAudioOn = false;
   let micDevices = [];
   let preferredMicId = '';
+  let camDevices = [];
+  let preferredCamId = '';
 
   function escapeHtml(v) {
     return String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -467,6 +472,30 @@
     } catch (err) { /* noop */ }
   }
 
+  async function refreshCamList() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      camDevices = all.filter((d) => d.kind === 'videoinput');
+
+      if (el.camSelect) {
+        if (!camDevices.length) {
+          el.camSelect.innerHTML = '<option value="">没有检测到摄像头</option>';
+        } else {
+          const activeTrack = camStream && camStream.getVideoTracks()[0];
+          const settings = activeTrack && activeTrack.getSettings ? activeTrack.getSettings() : {};
+          const active = preferredCamId || settings.deviceId || el.camSelect.value;
+          el.camSelect.innerHTML = camDevices
+            .map((d, i) => `<option value="${escapeHtml(d.deviceId)}">${escapeHtml(d.label || `摄像头 ${i + 1}`)}</option>`)
+            .join('');
+          const valid = camDevices.some((d) => d.deviceId === active);
+          if (valid && active) el.camSelect.value = active;
+          else if (camDevices[0]) el.camSelect.value = camDevices[0].deviceId;
+        }
+      }
+    } catch (err) { /* noop */ }
+  }
+
   /* ---------- 采集 ---------- */
 
   function showMediaIssue(kind) {
@@ -506,8 +535,8 @@
     }
   }
 
-  async function initVideo() {
-    if (camStream && camStream.getVideoTracks()[0]) return true;
+  async function initVideo(deviceId) {
+    if (!deviceId && camStream && camStream.getVideoTracks()[0]) return true;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       showMediaIssue(window.isSecureContext === false ? 'insecure' : 'nodevice');
       paintMediaState();
@@ -515,22 +544,26 @@
     }
 
     try {
+      const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } };
+      if (deviceId) video.deviceId = { exact: deviceId };
+
       const stream = await withTimeout(
-        navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
-          audio: false
-        }),
+        navigator.mediaDevices.getUserMedia({ video, audio: false }),
         12000,
         'gum-timeout'
       );
 
+      /* 切换设备：先把旧的关掉，否则摄像头指示灯会一直亮着 */
+      if (camStream && camStream !== stream) camStream.getTracks().forEach((t) => t.stop());
       camStream = stream;
       usingScreen = false;
       camOn = true;
+      preferredCamId = deviceId || '';
       if (el.openTab) el.openTab.hidden = true;
       if (el.retryCam) el.retryCam.hidden = true;
       applyStream(compose());
       refreshMicList();
+      refreshCamList();
 
       const vTrack = stream.getVideoTracks()[0];
       if (vTrack) {
@@ -727,9 +760,24 @@
     });
   }
 
+  if (el.camSelect) {
+    el.camSelect.addEventListener('change', async () => {
+      const id = el.camSelect.value;
+      if (!id) return;
+      if (usingScreen) {
+        toast('正在共享屏幕，先停止共享再切摄像头');
+        refreshCamList();
+        return;
+      }
+      const ok = await initVideo(id);
+      toast(ok ? '已切换摄像头' : '切换失败，检查摄像头是否被其它程序占用');
+    });
+  }
+
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
     navigator.mediaDevices.addEventListener('devicechange', () => {
       refreshMicList();
+      refreshCamList();
       paintAudioState();
     });
   }
@@ -816,6 +864,103 @@
       else if (micStream) toast('麦克风已就绪，摄像头还没拿到');
     });
   }
+
+  /* ================= 连接诊断 ================= */
+
+  /* 浏览器没法直接 telnet 端口，只能真建一条 relay-only 的 PeerConnection，
+     看能不能拿到 relay 候选：拿得到就说明 TURN 可达、凭证有效、网络放行。 */
+  function diagPaint(rows) {
+    if (!el.turnReport) return;
+    el.turnReport.hidden = false;
+    el.turnReport.innerHTML = rows.map((r) => {
+      const cls = r.state === 'ok' ? 'ok' : r.state === 'bad' ? 'bad' : 'wait';
+      return `<li class="diag-row ${cls}"><span class="diag-k">${escapeHtml(r.k)}</span>`
+        + `<span class="diag-v">${escapeHtml(r.v || '')}</span></li>`;
+    }).join('');
+  }
+
+  async function runTurnCheck() {
+    if (el.turnTest) el.turnTest.disabled = true;
+    const rows = [];
+    const set = (k, state, v) => {
+      const hit = rows.find((r) => r.k === k);
+      if (hit) { hit.state = state; hit.v = v; } else rows.push({ k, state, v });
+      diagPaint(rows);
+    };
+    const started = performance.now();
+
+    try {
+      set('读取凭证', 'wait', '…');
+      let ice = null;
+      try {
+        const res = await fetch('/api/ice', { credentials: 'same-origin', cache: 'no-store' });
+        if (!res.ok) throw new Error(String(res.status));
+        ice = (await res.json()).ice || {};
+      } catch (err) {
+        set('读取凭证', 'bad', '接口不可用');
+        return;
+      }
+
+      const servers = ice.iceServers || [];
+      if (!servers.length) {
+        set('读取凭证', 'bad', '服务端没有配置 TURN');
+        return;
+      }
+      const hours = Math.round((Number(ice.ttl) || 0) / 3600);
+      set('读取凭证', 'ok', `1 条中继 · 有效 ${hours}h`);
+      set('线路', 'ok', ice.line || '—');
+
+      set('收集中继候选', 'wait', '…');
+      const pc = new RTCPeerConnection({ iceServers: servers, iceTransportPolicy: 'relay' });
+      const cands = [];
+      let firstAt = 0;
+      let done = false;
+      const finished = new Promise((resolve) => {
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        pc.onicecandidate = (e) => {
+          if (!e.candidate) return finish();
+          if (!firstAt) firstAt = performance.now();
+          cands.push(e.candidate);
+        };
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === 'complete') finish();
+        };
+        setTimeout(finish, 8000);
+      });
+
+      try {
+        pc.createDataChannel('probe');
+        await pc.setLocalDescription(await pc.createOffer());
+        await finished;
+      } finally {
+        try { pc.close(); } catch (err) { /* noop */ }
+      }
+
+      const relay = cands.filter((c) => String(c.type) === 'relay');
+      const udp = relay.filter((c) => String(c.protocol || '').toLowerCase() === 'udp');
+      const tcp = relay.filter((c) => String(c.protocol || '').toLowerCase() === 'tcp');
+      const addr = relay[0] && (relay[0].address || relay[0].relatedAddress);
+
+      if (!relay.length) {
+        set('收集中继候选', 'bad', '无中继候选');
+        set('可能原因', 'bad', 'TURN 不可达 / 凭证无效 / 网络拦截');
+        return;
+      }
+      set('收集中继候选', 'ok', `${relay.length} 个${addr ? ` · ${addr}` : ''}`);
+      set('UDP 通道', udp.length ? 'ok' : 'bad', udp.length ? `${udp.length} 个` : '无');
+      /* 浏览器一般只收集它最想用的那种传输：UDP 通了就不会再试 TCP。
+         所以没收集到 TCP 不算故障，只有两者都没有才是真的连不上。 */
+      set('TCP 通道', tcp.length ? 'ok' : 'wait',
+        tcp.length ? `${tcp.length} 个` : '未收集（浏览器优先 UDP）');
+      set('握手耗时', 'ok', `${Math.round((firstAt || performance.now()) - started)} ms`);
+    } catch (err) {
+      set('诊断中断', 'bad', String(err && err.message ? err.message : err));
+    } finally {
+      if (el.turnTest) el.turnTest.disabled = false;
+    }
+  }
+
+  if (el.turnTest) el.turnTest.addEventListener('click', runTurnCheck);
 
   /* ================= 直播控制 ================= */
 

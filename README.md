@@ -98,6 +98,27 @@ docker run --rm -p 3000:3000 \
   luma-live
 ```
 
+## 部署方式
+
+一键脚本按「机器怎么分」给了三种模式（Ubuntu / Debian）：
+
+```bash
+# 1) 一台机器同时跑 LUMA 和 TURN
+sudo bash scripts/deploy.sh all-in-one <公网IP或域名>
+
+# 2) 两台机器：TURN 机装中继并打印 TURN_LINES
+sudo bash scripts/deploy.sh turn <公网IP或域名>
+#    应用机拿到上面那行，装 LUMA
+sudo bash scripts/deploy.sh app "main|turn.example.com|3478|<secret>|主线路"
+
+# 3) 任意机器自检（不需要 root）
+bash scripts/deploy.sh status
+```
+
+`all-in-one` 与 `turn` 内部会调用 `scripts/setup-turn.sh`，不会重复装 coturn。
+`app` 模式只装依赖、同步代码、写 `/etc/luma-live.env`、注册 systemd 服务，不碰 TURN。
+三种模式都是幂等的：重复执行只会覆盖代码与配置，不会重置已有账号库。
+
 ## 部署 TURN
 
 > **需要跨网络观看？** 在公网 Ubuntu / Debian 服务器运行下面的命令，脚本会安装 coturn、生成随机共享密钥并准备 LUMA Live 配置。
@@ -160,6 +181,7 @@ flowchart LR
 - **账号安全**：密码用 scrypt（随机盐）存储，旧的 `sha256:` 或明文记录在成功登录后自动升级；登录 cookie 为 HttpOnly + SameSite=Strict；失败次数按来源 IP 限制，连续失败达到阈值后暂时锁定。
 - **口令不进 URL**：开播端先用 `POST /api/sse-ticket` 把口令换成 60 秒一次性票据，再拼进 SSE 的 query，口令只出现在请求体里，不会落到反代访问日志。
 - **重连与接管**：主播信令断开后进入宽限期；新开播台接管时，旧页面收到 `host-taken` 后停止推流和自动重连。
+- **连接诊断**：开播台可以就地跑一次 relay-only 的候选收集（`GET /api/ice` 取临时凭证），把「凭证 / 线路 / 中继候选 / UDP / TCP / 握手耗时」逐项列出来，不用先开播就能判断 TURN 通不通。
 
 ## 设计取舍
 
