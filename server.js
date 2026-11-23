@@ -49,6 +49,8 @@ const AVATAR_DIR = path.join(DATA_DIR, 'avatars');
 const USER_FILE_MAX = 2 * 1024 * 1024;
 const AVATAR_MAX_BYTES = 512 * 1024;
 const ALLOWED_AVATAR_EXT = new Set(['.png', '.jpg', '.webp']);
+/* 启动就把数据目录建好：/readyz 拿 W_OK 判断是否可写，第一次部署时目录还不存在 */
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (err) { /* 只读文件系统：留给 /readyz 报 */ }
 
 /* name -> { cred, avatar }，cred 为明文或 sha256:摘要；avatar 为纯文件名 `<hash>.<ext>` */
 const USER_DB = new Map();
@@ -1277,12 +1279,99 @@ async function handleApi(req, res, url) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 安全响应头 / 跨站写请求闸门 / 健康检查
+ * ------------------------------------------------------------------ */
+
+/* 页面里没有内联脚本，所以 script-src 不用开 unsafe-inline；
+   style 与字体得放开：界面用 style 标签排版，中文走 npmmirror 的文楷。 */
+const CSP = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "style-src 'self' 'unsafe-inline' https://registry.npmmirror.com",
+  "font-src 'self' data: https://registry.npmmirror.com",
+  "script-src 'self'",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob: data:",
+  "connect-src 'self'"
+].join('; ');
+
+const PERMISSIONS_POLICY = [
+  'camera=(self)', 'microphone=(self)', 'display-capture=(self)',
+  'geolocation=()', 'payment=()', 'usb=()'
+].join(', ');
+
+function isHttps(req) {
+  if (req.socket && req.socket.encrypted) return true;
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  return proto === 'https';
+}
+
+function applySecurityHeaders(req, res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', CSP);
+  res.setHeader('Permissions-Policy', PERMISSIONS_POLICY);
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  /* 只在确实跑在 HTTPS 上时才发 HSTS：源站走 http 反代时发它会把用户锁死 */
+  if (isHttps(req)) {
+    res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  }
+}
+
+/* Cookie 已经是 SameSite=Strict，跨站请求本来带不上。
+   这里再挡一层显式带着别人的 Origin/Referer 来的写请求，防止反代或老浏览器把 SameSite 丢掉。
+   两个头都没有（curl、同源表单、部分旧浏览器）就放行，交给 cookie 兜底。 */
+const UNSAFE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+function crossSiteWrite(req, pathname) {
+  if (!UNSAFE_METHODS.has(req.method)) return false;
+  if (!pathname.startsWith('/api/')) return false;
+  const source = req.headers.origin || req.headers.referer || '';
+  if (!source) return false;
+  const host = String(req.headers.host || '').toLowerCase();
+  try {
+    return new URL(source).host.toLowerCase() !== host;
+  } catch (err) {
+    return true; /* Origin: null 之类解析不了的头，直接按跨站处理 */
+  }
+}
+
+function readiness() {
+  const checks = {};
+  let ok = true;
+  if (shuttingDown) { checks.server = 'shutting-down'; ok = false; }
+  else checks.server = 'ok';
+
+  try {
+    fs.accessSync(DATA_DIR, fs.constants.W_OK);
+    checks.dataDir = 'writable';
+  } catch (err) {
+    checks.dataDir = 'not-writable';
+    ok = false;
+  }
+
+  if (AUTH_ENABLED) checks.auth = `accounts:${USER_DB.size}`;
+  else if (STREAM_KEY) checks.auth = 'stream-key';
+  else checks.auth = 'open';
+
+  checks.turn = RELAY_LINE ? `${RELAY_LINE.id}@${RELAY_LINE.host}:${RELAY_LINE.port}` : 'none';
+  checks.live = Boolean(stream.live);
+  checks.clients = clients.size;
+  checks.uptime = Math.round(process.uptime());
+  return { ok, checks };
+}
+
+/* ------------------------------------------------------------------ *
  * server
  * ------------------------------------------------------------------ */
 
 const server = http.createServer((req, res) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'no-referrer');
+  applySecurityHeaders(req, res);
   let url;
   try {
     url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -1291,6 +1380,19 @@ const server = http.createServer((req, res) => {
     return json(res, 400, { error: 'bad URI' });
   }
   req.session = sessionOf(req, res);
+
+  /* 健康检查放在鉴权之前：反代、systemd、uptime 探针都不带 cookie */
+  if (url.pathname === '/healthz') {
+    return json(res, 200, { ok: true, uptime: Math.round(process.uptime()), pid: process.pid });
+  }
+  if (url.pathname === '/readyz') {
+    const r = readiness();
+    return json(res, r.ok ? 200 : 503, r);
+  }
+
+  if (crossSiteWrite(req, url.pathname)) {
+    return json(res, 403, { error: '跨站请求已拒绝', code: 'cross-site' });
+  }
 
   /* 无需登录即可访问：登录页本身、它的脚本、公共样式，以及登录相关 API。
      /api/login、/api/logout、/api/me 由 handleApi 内部处理（其中 login 免鉴权）。 */
@@ -1326,6 +1428,38 @@ const server = http.createServer((req, res) => {
   }
   serveStatic(req, res, url);
 });
+
+/* 优雅退出：先把「服务器要重启」推给在线页面，再关 SSE、清房间状态。
+   否则 systemd / Docker 重启时，客户端只会看到 EventSource 无声断开，
+   前端要等自动重连超时才反应过来。 */
+let shuttingDown = false;
+
+/* 退出日志走同步写：接管道（systemd / docker）时 console.log 是异步的，
+   紧接着 process.exit() 会把还没刷出去的日志吞掉，journalctl 里就看不到退出了。 */
+function logSync(line) {
+  try { fs.writeSync(1, `${line}\n`); } catch (err) { /* fd 1 不可写就算了 */ }
+}
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logSync(`收到 ${signal}，开始优雅退出（在线连接 ${clients.size} 个）`);
+  broadcast('server-shutdown', { reason: 'restart', at: Date.now() });
+  for (const c of clients.values()) {
+    try { c.res.end(); } catch (err) { /* noop */ }
+  }
+  clients.clear();
+  accountConns.clear();
+  if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+  if (stateTimer) { clearTimeout(stateTimer); stateTimer = null; }
+  if (hostGraceTimer) { clearTimeout(hostGraceTimer); hostGraceTimer = null; }
+  server.close(() => process.exit(0));
+  const force = setTimeout(() => process.exit(0), 2000);
+  if (force.unref) force.unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 server.headersTimeout = 60000;
 server.requestTimeout = 30000;

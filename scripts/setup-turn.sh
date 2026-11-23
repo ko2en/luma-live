@@ -2,10 +2,141 @@
 set -Eeuo pipefail
 
 # LUMA Live 一键部署 coturn（Ubuntu / Debian）
-# 用法：sudo bash scripts/setup-turn.sh [TURN 主机名或公网 IP]
+#
+# 安装：sudo bash scripts/setup-turn.sh [TURN 主机名或公网 IP]
+# 自检：bash scripts/setup-turn.sh --check      （不需要 root，只读检查）
+
+TURN_SECRET_FILE="/etc/luma-live/turn-secret"
+TURN_CONF="/etc/turnserver.conf"
+LUMA_ENV="/etc/luma-live/turn.env"
+
+MODE="install"
+POSITIONAL=()
+for arg in "$@"; do
+  case "${arg}" in
+    --check) MODE="check" ;;
+    -h|--help)
+      sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) POSITIONAL+=("${arg}") ;;
+  esac
+done
+
+if [[ "${MODE}" == "check" ]]; then
+  ok=0; warn=0; fail=0
+  line() { printf '%-8s %s\n' "$1" "$2"; }
+  pass() { line "[OK]" "$1"; ok=$((ok + 1)); }
+  soft() { line "[WARN]" "$1"; warn=$((warn + 1)); }
+  bad()  { line "[FAIL]" "$1"; fail=$((fail + 1)); }
+
+  echo "LUMA Live · TURN 自检"
+  echo
+
+  if systemctl is-active --quiet coturn 2>/dev/null; then
+    pass "coturn 服务运行中"
+  else
+    bad "coturn 服务未运行（systemctl status coturn）"
+  fi
+
+  if [[ -s "${TURN_CONF}" ]]; then
+    pass "配置文件存在 ${TURN_CONF}"
+    PORT="$(grep -E '^listening-port=' "${TURN_CONF}" | head -1 | cut -d= -f2)"
+    PORT="${PORT:-3478}"
+    if ss -H -lun 2>/dev/null | grep -q ":${PORT}\b"; then
+      pass "UDP ${PORT} 正在监听"
+    else
+      bad "UDP ${PORT} 没有监听"
+    fi
+    if ss -H -ltn 2>/dev/null | grep -q ":${PORT}\b"; then
+      pass "TCP ${PORT} 正在监听"
+    else
+      bad "TCP ${PORT} 没有监听"
+    fi
+    if grep -qE '^min-port=' "${TURN_CONF}" && grep -qE '^max-port=' "${TURN_CONF}"; then
+      pass "中继端口段 $(grep -E '^min-port=' "${TURN_CONF}" | cut -d= -f2)-$(grep -E '^max-port=' "${TURN_CONF}" | cut -d= -f2)"
+    else
+      soft "未配置 min-port / max-port，中继可能占用随机高位端口"
+    fi
+    if grep -q '^use-auth-secret' "${TURN_CONF}"; then
+      pass "已启用 REST 临时凭证"
+    else
+      bad "未启用 use-auth-secret，LUMA Live 下发的凭证会被拒绝"
+    fi
+  else
+    bad "找不到 ${TURN_CONF}（还没跑过安装？）"
+  fi
+
+  if [[ -f "${TURN_SECRET_FILE}" ]]; then
+    PERM="$(stat -c '%a' "${TURN_SECRET_FILE}" 2>/dev/null || echo '?')"
+    if [[ "${PERM}" == "600" ]]; then
+      pass "secret 文件权限 600"
+    else
+      soft "secret 文件权限为 ${PERM}，建议 chmod 600"
+    fi
+  else
+    bad "找不到 ${TURN_SECRET_FILE}"
+  fi
+
+  if [[ -f "${LUMA_ENV}" ]]; then
+    pass "LUMA 环境文件存在 ${LUMA_ENV}"
+    if grep -q '^TURN_LINES=' "${LUMA_ENV}"; then
+      pass "TURN_LINES 已写入"
+    else
+      bad "${LUMA_ENV} 里没有 TURN_LINES"
+    fi
+    if [[ -f /etc/luma-live.env ]] && ! grep -q 'TURN_LINES' /etc/luma-live.env 2>/dev/null; then
+      soft "服务读的是 /etc/luma-live.env，记得把 TURN_LINES 也放进去"
+    fi
+  else
+    soft "没有 ${LUMA_ENV}（如果你是用别的变量注入 TURN_LINES，可忽略）"
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    for rule in "${PORT:-3478}/udp" "${PORT:-3478}/tcp" "5349/tcp"; do
+      if ufw status 2>/dev/null | grep -q "${rule}"; then
+        pass "ufw 放行 ${rule}"
+      else
+        soft "ufw 未放行 ${rule}"
+      fi
+    done
+    if ufw status 2>/dev/null | grep -q '49152:65535/udp'; then
+      pass "ufw 放行中继端口段"
+    else
+      soft "ufw 未放行 49152:65535/udp"
+    fi
+  else
+    soft "未启用 ufw（若用云安全组，请自行确认放行 TCP/UDP ${PORT:-3478} 与 UDP 49152-65535）"
+  fi
+
+  PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  if [[ -n "${PUBLIC_IP}" ]]; then
+    pass "公网出口 IP ${PUBLIC_IP}"
+    SERVER_NAME="$(grep -E '^server-name=' "${TURN_CONF}" 2>/dev/null | head -1 | cut -d= -f2)"
+    if [[ -n "${SERVER_NAME}" && "${SERVER_NAME}" != "${PUBLIC_IP}" && "${SERVER_NAME}" =~ ^[0-9.]+$ ]]; then
+      soft "server-name 是 ${SERVER_NAME}，与本机出口 ${PUBLIC_IP} 不一致（多网卡/多出口时属正常）"
+    fi
+  else
+    soft "取不到公网 IP（离线或被限制），跳过比对"
+  fi
+
+  if [[ -f /etc/luma-live.env && "${EUID}" -eq 0 ]]; then
+    if grep -q '^TURN_LINES=' /etc/luma-live.env 2>/dev/null; then
+      pass "LUMA Live 服务环境已包含 TURN_LINES"
+    else
+      soft "LUMA Live 服务环境没有 TURN_LINES，开播会失败"
+    fi
+  fi
+
+  echo
+  echo "结果：${ok} 项通过，${warn} 项提醒，${fail} 项失败"
+  [[ "${fail}" -eq 0 ]] || exit 1
+  echo "云厂商安全组脚本无法检查，请自行确认 TCP/UDP 3478 与 UDP 49152-65535 已放行。"
+  exit 0
+fi
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "请使用 root 权限运行：sudo bash scripts/setup-turn.sh [公网 IP 或域名]" >&2
+  echo "安装需要 root：sudo bash scripts/setup-turn.sh [公网 IP 或域名]" >&2
+  echo "只想自检可以不带 sudo：bash scripts/setup-turn.sh --check" >&2
   exit 1
 fi
 
@@ -14,7 +145,7 @@ if ! command -v apt-get >/dev/null 2>&1; then
   exit 1
 fi
 
-TURN_HOST="${1:-}"
+TURN_HOST="${POSITIONAL[0]:-}"
 if [[ -z "${TURN_HOST}" ]]; then
   read -r -p "请输入 TURN 服务器公网 IP 或域名：" TURN_HOST
 fi
@@ -26,9 +157,6 @@ fi
 TURN_REALM="${TURN_REALM:-luma-live}"
 TURN_PORT="${TURN_PORT:-3478}"
 TURN_TITLE="${TURN_TITLE:-主线路}"
-TURN_SECRET_FILE="/etc/luma-live/turn-secret"
-TURN_CONF="/etc/turnserver.conf"
-LUMA_ENV="/etc/luma-live/turn.env"
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y coturn openssl

@@ -1,0 +1,36 @@
+# LUMA Live + Caddy（自动 HTTPS）
+#
+# 1. 把域名解析到这台机器，确认 80 / 443 已放行
+# 2. sudo cp deploy/Caddyfile.example /etc/caddy/Caddyfile
+#    改掉下面的域名和端口
+# 3. sudo systemctl reload caddy
+#
+# Caddy 会自动申请并续期证书，不需要额外配 certbot。
+
+luma.example.com {
+	encode zstd gzip
+
+	# SSE：必须关掉缓冲，否则聊天和状态要攒满一包才推给浏览器
+	@events path /api/events
+	reverse_proxy @events 127.0.0.1:3000 {
+		flush_interval -1
+		transport http {
+			read_timeout 1h
+			write_timeout 1h
+		}
+	}
+
+	# 其余请求（页面、静态资源、普通 API）
+	reverse_proxy 127.0.0.1:3000
+
+	# 头像上传默认上限 8MB，够用又不会被人当网盘
+	request_body {
+		max_size 8MB
+	}
+}
+
+# 说明：
+# - Caddy 会自动带上 X-Forwarded-For / X-Forwarded-Proto，
+#   所以服务端要设 TRUST_PROXY=1，登录限速才按真实访客 IP 计数。
+# - 服务端只监听 127.0.0.1 时，把 Caddy 里的上游改成 127.0.0.1:3000；
+#   如果 Node 监听 0.0.0.0:3000，请用防火墙挡住 3000，只让 Caddy 访问。

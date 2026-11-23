@@ -207,9 +207,19 @@ npm run test:video    # 发送参数与画质
 npm run test:relay    # relay 候选与中继识别
 npm run test:e2e      # 开播、观看、刷新重连
 npm run test:studio   # 开播口令流程
+npm run doctor        # 部署自检：Node 版本、数据目录、账号、TURN、端口占用
 ```
 
 > 测试通过仅表示相应自动化场景通过，不等价于跨浏览器、跨网络或生产容量认证。
+
+部署后可以先跑一次 `npm run doctor` 再开播；TURN 那边有对应的只读自检：
+
+```bash
+bash scripts/setup-turn.sh --check
+```
+
+反代与守护进程的模板放在 `deploy/`：`Caddyfile.example`、`nginx.conf.example`、`luma-live.service`。
+服务端提供 `/healthz`（进程存活）和 `/readyz`（数据目录可写、账号与 TURN 配置），两者都不需要登录，可以直接挂给探针。
 
 ## 运行边界
 

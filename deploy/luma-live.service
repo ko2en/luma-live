@@ -1,0 +1,42 @@
+[Unit]
+Description=LUMA Live
+Documentation=https://github.com/ko2en/luma-live
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/luma-live
+ExecStart=/usr/bin/node server.js
+EnvironmentFile=/etc/luma-live.env
+
+# 收到 SIGTERM / SIGINT 时，服务端会先给在线页面推 server-shutdown，
+# 再关掉 SSE 与房间状态，所以这里留够时间让它自己收尾。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=always
+RestartSec=3
+
+# 建议用专用账号跑（先 useradd -r -s /usr/sbin/nologin luma，
+# 再把 /opt/luma-live 与 data 目录 chown 给它）。
+# 用 root 跑就把下面两行删掉。
+User=luma
+Group=luma
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/opt/luma-live/data
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
+
+# 启用：
+#   sudo cp deploy/luma-live.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now luma-live
+#   systemctl status luma-live --no-pager
+# 日志：
+#   journalctl -u luma-live -f

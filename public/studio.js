@@ -1398,6 +1398,16 @@
       paintLiveState();
     });
 
+    /* 服务端优雅退出：停掉本端推流并提示，别让主播以为是自己的网络问题 */
+    es.addEventListener('server-shutdown', () => {
+      live = false;
+      startedAt = null;
+      closeAllPeers();
+      paintLiveState();
+      toast('服务器正在重启，稍后刷新本页');
+      try { es.close(); } catch (err) { /* noop */ }
+    });
+
     es.addEventListener('signal', async (e) => {
       const { from, data } = JSON.parse(e.data) || {};
       if (!from || !data) return;

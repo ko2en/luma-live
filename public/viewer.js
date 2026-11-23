@@ -638,6 +638,13 @@
       offline('直播已结束', '主播结束了本场直播，页面会自动等待下一场。');
     });
 
+    /* 服务端优雅退出时先发这条，避免用户把「服务器重启」当成网络卡死 */
+    es.addEventListener('server-shutdown', () => {
+      setLive(false);
+      offline('服务器正在重启', '稍等十几秒刷新本页就能继续观看。');
+      try { es.close(); } catch (err) { /* noop */ }
+    });
+
     /* 同一账号在别处观看/开播：本页立刻停看、断流，且不再自动重连，
        否则两个页面会反复互踢。 */
     es.addEventListener('account-taken', () => {
