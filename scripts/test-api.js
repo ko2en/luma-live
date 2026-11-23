@@ -275,6 +275,14 @@ async function testTurn() {
     const badTicket = await sse('role=host&id=hostB&name=Luma&ticket=not-a-ticket');
     check('伪造票据 → 401', badTicket.status === 401);
 
+    /* 票据绑定 role + id：拿去喂别的身份必须无效 */
+    const viewerTicket = await sseTicket('hRole', 'viewer');
+    const wrongRole = await sse(`role=host&id=hRole&ticket=${viewerTicket.ticket}`);
+    check('票据角色不匹配 → 401', wrongRole.status === 401, `status=${wrongRole.status}`);
+    const idTicket = await sseTicket('hIdA');
+    const wrongId = await sse(`role=host&id=hIdB&ticket=${idTicket.ticket}`);
+    check('票据 id 不匹配 → 401', wrongId.status === 401, `status=${wrongId.status}`);
+
     const viewer = await sse('role=viewer&id=v1&name=%E9%98%BF%E6%98%8E');
     const vWelcome = await viewer.waitFor('welcome');
     check('观众无需口令', viewer.status === 200 && !!vWelcome);
@@ -427,6 +435,25 @@ async function testTurn() {
     const recovered = await req('POST', '/api/auth', { key: KEY });
     check('锁定期满 → 恢复 200', recovered.status === 200);
 
+    // ---- 11. scrypt 参数边界（不经过 HTTP，直接测模块） ----
+    const pw = require('../src/password');
+    const salt = 'a'.repeat(32);
+    const hash = 'b'.repeat(64);
+    const badCreds = [
+      ['N 不是 2 的幂', `scrypt:100000:8:1:${salt}:${hash}`],
+      ['N 过大', `scrypt:1048576:8:1:${salt}:${hash}`],
+      ['r 过大', `scrypt:16384:64:1:${salt}:${hash}`],
+      ['p 过大', `scrypt:16384:8:9:${salt}:${hash}`],
+      ['hash 过短', `scrypt:16384:8:1:${salt}:bb`]
+    ];
+    for (const [label, cred] of badCreds) {
+      const r = await pw.verifyCredential(cred, 'whatever');
+      check(`异常 scrypt 参数（${label}）直接判失败`, r.ok === false);
+    }
+    const good = await pw.hashCredential('pass-123');
+    check('自产 scrypt 摘要校验通过', (await pw.verifyCredential(good, 'pass-123')).ok === true);
+    check('自产 scrypt 摘要拒绝错误密码', (await pw.verifyCredential(good, 'nope')).ok === false);
+
     viewer.close();
     v3.close();
   } finally {
@@ -529,6 +556,14 @@ async function testLines() {
   const g = await iceOrder(env, PORT + 17, 'sh');
   check('固定上海 → iceTransportPolicy=relay', !!(g.ice && g.ice.iceTransportPolicy === 'relay'),
     String(g.ice && g.ice.iceTransportPolicy));
+
+  /* 5.5 TURN_DEFAULT 指定哪条线路就下发哪条（多线路格式预留） */
+  const two = 'hk|203.0.113.30|3478||香港,tokyo|203.0.113.40|3478||东京';
+  const j = await iceOrder({ TURN_LINES: two, TURN_DEFAULT: 'tokyo' }, PORT + 21);
+  check('TURN_DEFAULT 选中第二条线路', !!(j.ice && j.ice.line === 'tokyo'), String(j.ice && j.ice.line));
+  check('只下发被选中那条的 TURN host', turnHosts(j.ice).join(',') === '203.0.113.40', turnHosts(j.ice).join(','));
+  const k = await iceOrder({ TURN_LINES: two, TURN_DEFAULT: 'nowhere' }, PORT + 22);
+  check('TURN_DEFAULT 写错时退回第一条', !!(k.ice && k.ice.line === 'hk'), String(k.ice && k.ice.line));
 
   /* 6. 主播与观众都使用同一上海 ICE 配置 */
   const i = await iceOrder(env, PORT + 19, '', 'host');

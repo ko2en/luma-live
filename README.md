@@ -156,6 +156,7 @@ flowchart LR
 - **媒体**：主播为每位观众建立独立 WebRTC 连接；服务端只负责信令和配置，不处理媒体转码。
 - **强制中继**：浏览器使用 `iceTransportPolicy: relay`，`iceServers` 只下发配置的 TURN（UDP + TCP）。中继不可用时直接失败。
 - **临时凭证**：coturn REST 凭证由服务端现签，客户端只拿到限时凭证。
+- **输入校验**：`users.json` 按不可信输入处理 —— 校验版本、单条记录结构、账号名合法字符与数量上限，坏记录跳过并告警；`scrypt` 参数限定在合理区间（N 必须是 2 的幂、内存上限 256MB），避免被放大的参数拖死进程。
 - **账号安全**：密码用 scrypt（随机盐）存储，旧的 `sha256:` 或明文记录在成功登录后自动升级；登录 cookie 为 HttpOnly + SameSite=Strict；失败次数按来源 IP 限制，连续失败达到阈值后暂时锁定。
 - **口令不进 URL**：开播端先用 `POST /api/sse-ticket` 把口令换成 60 秒一次性票据，再拼进 SSE 的 query，口令只出现在请求体里，不会落到反代访问日志。
 - **重连与接管**：主播信令断开后进入宽限期；新开播台接管时，旧页面收到 `host-taken` 后停止推流和自动重连。
@@ -190,7 +191,7 @@ flowchart LR
 | `CHAT_MIN_INTERVAL` | `350` | 单连接聊天最小间隔（毫秒） |
 | `TRUST_PROXY` | 未设置 | 可信反向代理后设为 `1`，读取 `X-Forwarded-For` |
 | `TURN_LINES` | 空 | `id\|host\|port\|secret\|标题`，多条逗号分隔；当前只使用第一条 |
-| `TURN_DEFAULT` | 第一条线路 | 兼容旧配置，实际固定使用 `TURN_LINES` 第一条 |
+| `TURN_DEFAULT` | 第一条线路 | 指定生效的线路 id（找不到就退回第一条）；页面始终只用这一条，不提供切换 |
 
 示例：
 

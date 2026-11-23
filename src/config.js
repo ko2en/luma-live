@@ -143,17 +143,25 @@ if (!TURN_LINES.length && TURN_HOST) {
   }
 }
 
-/* 默认线路：TURN_DEFAULT 填线路 id；不设就用第一条 TURN 线路 */
+/* 默认线路：TURN_DEFAULT 填线路 id，命中就用它；不设或写错就退回第一条。
+   页面始终只用这一条线路（不做切换、不做回退），但「哪一条」由配置说了算，
+   换机房只改环境变量，不用动代码。 */
 const TURN_DEFAULT = str(process.env.TURN_DEFAULT);
-/* 中继线路固定为配置里的第一条。名字交给 TURN_LINES 的标题决定，
-   代码里不写死城市名——换机房只改环境变量。 */
-const RELAY_LINE = TURN_LINES[0] || null;
+const RELAY_LINE = (TURN_DEFAULT
+  && TURN_LINES.find((l) => l.id.toLowerCase() === TURN_DEFAULT.toLowerCase()))
+  || TURN_LINES[0]
+  || null;
 const RELAY_TITLE = (RELAY_LINE && RELAY_LINE.title) || '中继';
 
 /* 不再保留默认兜底：只有一条 relay 线路，失败就停在未连接，不换路。 */
 const DEFAULT_STUN = [];
 
-module.exports = {
+/* 配置是只读的：启动后任何模块改它都属于 bug，这里直接冻住 */
+TURN_LINES.forEach((l) => Object.freeze(l));
+Object.freeze(TURN_LINES);
+if (RELAY_LINE) Object.freeze(RELAY_LINE);
+
+module.exports = Object.freeze({
   PORT,
   PUBLIC_DIR,
   STREAM_KEY,
@@ -193,4 +201,4 @@ module.exports = {
   RELAY_TITLE,
   DEFAULT_STUN,
   parseTurnLines
-};
+});
