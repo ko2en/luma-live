@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/WebRTC-TURN%20relay-7c3aed?logo=webrtc&logoColor=white" alt="WebRTC TURN relay">
 </p>
 
-[快速开始](#快速开始) · [核心能力](#核心能力) · [工作原理](#工作原理) · [配置](#配置) · [验证](#验证) · [路线图](#路线图)
+[快速开始](#快速开始) · [一键配置 TURN](#一键配置-turn) · [核心能力](#核心能力) · [工作原理](#工作原理) · [配置](#配置) · [验证](#验证) · [路线图](#路线图)
 
 </div>
 
@@ -75,6 +75,38 @@ docker run --rm -p 3000:3000 \
   -v luma-data:/app/data \
   luma-live
 ```
+
+## 一键配置 TURN
+
+跨网络观看需要 TURN 中继。项目提供了面向 Ubuntu / Debian 新手的脚本：它会安装 coturn、生成随机共享密钥、写入配置、启动服务，并生成 LUMA Live 可直接使用的 `TURN_LINES`。
+
+在一台**独立的公网 Ubuntu / Debian 服务器**上执行：
+
+```bash
+git clone https://github.com/ko2en/luma-live.git
+cd luma-live
+sudo bash scripts/setup-turn.sh turn.example.com
+```
+
+如果没有域名，也可以直接填写公网 IP：
+
+```bash
+sudo bash scripts/setup-turn.sh 203.0.113.10
+```
+
+脚本完成后，将输出的环境文件复制到运行 LUMA Live 的机器（或直接在同一台机器执行）：
+
+```bash
+set -a
+source /etc/luma-live/turn.env
+set +a
+node server.js
+```
+
+> [!WARNING]
+> 脚本只自动配置服务器本机的 `ufw`。如果服务器使用云厂商安全组，还必须手动放行 TURN 端口（默认 TCP/UDP `3478`、TCP/UDP `5349`）和 UDP `49152-65535`。不要把 `/etc/luma-live/turn-secret` 或 `/etc/luma-live/turn.env` 提交到 Git。
+
+脚本当前支持 Ubuntu / Debian + systemd + coturn；其他发行版请参考 `turnserver.conf` 的同等配置手动部署。
 
 ### 部署前必读
 
@@ -179,7 +211,7 @@ npm run test:studio   # 开播口令流程
 ```text
 server.js              静态服务、账号会话、SSE、信令、聊天、房间状态与 ICE 下发
 public/                 登录页、观众页、开播台与前端逻辑
-scripts/                API 与浏览器回归测试
+scripts/                API、浏览器回归测试与 TURN 部署脚本
 start.bat / start.sh    Windows / macOS / Linux 启动入口
 Dockerfile              容器构建配置
 docs/                   README 截图
@@ -199,6 +231,7 @@ data/                   运行时生成的账号库与头像（不入库）
 - [ ] SSE 使用短期 token 取代 query 中的凭证
 - [ ] 录像与回看
 - [ ] 可选 SFU 模式
+- [x] Ubuntu / Debian 一键配置 TURN 脚本
 
 ## 贡献与反馈
 

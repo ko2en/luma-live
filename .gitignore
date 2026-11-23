@@ -3,6 +3,9 @@ node_modules/
 
 # 运行时产物
 *.log
+.env
+*.env.local
+turn.env
 .DS_Store
 Thumbs.db
 
