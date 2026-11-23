@@ -238,12 +238,21 @@ bash scripts/setup-turn.sh --check
 ## 目录结构
 
 ```text
-server.js              静态服务、账号会话、SSE、信令、聊天、房间状态与 ICE 下发
+server.js               HTTP 装配：路由、登录态、SSE 接入、房间 API（约 900 行）
+src/
+  config.js             所有环境变量的唯一入口（默认值、兼容老变量、路径解析）
+  http.js               JSON 响应、请求体、安全响应头、跨站校验、静态文件
+  live.js               运行态：在线连接、SSE 广播、聊天记录、断线宽限
+  users.js              账号库：users.json 原子写、头像文件校验
+  password.js           scrypt 摘要与老格式（sha256/明文）透明升级
+  turn.js               TURN 线路与 REST 凭证现签
+  util.js               定时安全比较
 public/                 登录页、观众页、开播台与前端逻辑
-scripts/                API、浏览器回归测试与 TURN 部署脚本
+scripts/                API / 浏览器回归测试、TURN 部署与自检、密码摘要工具
+deploy/                 Caddyfile、nginx.conf、systemd 模板
 start.bat / start.sh    Windows / macOS / Linux 启动入口
 Dockerfile              容器构建配置
-docs/                   README 截图
+docs/                   README 截图与横幅
 data/                   运行时生成的账号库与头像（不入库）
 ```
 
@@ -257,7 +266,7 @@ data/                   运行时生成的账号库与头像（不入库）
 - [x] 强制中继的固定发送参数
 - [x] 公网 TURN 中继链路实测
 - [ ] 逐观众自适应码率
-- [ ] SSE 使用短期 token 取代 query 中的凭证
+- [x] SSE 使用短期票据取代 query 中的凭证
 - [ ] 录像与回看
 - [ ] 可选 SFU 模式
 - [x] Ubuntu / Debian 一键配置 TURN 脚本

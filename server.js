@@ -11,12 +11,33 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const PORT = Number(process.env.PORT || 3000);
-const PUBLIC_DIR = path.join(__dirname, 'public');
-
-/* 开播口令：设了就必须带对才能占住 host 身份。
-   不设则任何人打开 /studio 都能开播（只适合本机/内网自用）。 */
-const STREAM_KEY = String(process.env.STREAM_KEY || '').trim();
+/* 配置集中在一处：只允许 src/config.js 读 process.env */
+const config = require('./src/config');
+const { safeEqual } = require('./src/util');
+const { pickLine, icePayload } = require('./src/turn');
+const {
+  json, readBody, addCookie, secureCookie,
+  applySecurityHeaders, crossSiteWrite, serveStatic
+} = require('./src/http');
+const {
+  clients, accountConns, chatLog, lastChatAt, nextChatSeq, stream, supersededHosts,
+  noteSuperseded, clearHostGrace, startHostGrace, viewerDescriptors, statePayload,
+  writeSse, sendTo, broadcast, broadcastState, startHeartbeat, evictAccount, closeAll, colorFor,
+  issueSseTicket, takeSseTicket
+} = require('./src/live');
+const { hashCredential, verifyCredential, DUMMY_CRED } = require('./src/password');
+const {
+  USER_DB, saveUserFile, validUserName, validAvatarFile, sniffImage, avatarUrlOf, AUTH_ENABLED
+} = require('./src/users');
+const {
+  PORT, PUBLIC_DIR, STREAM_KEY,
+  DATA_DIR, AVATAR_DIR, AVATAR_MAX_BYTES, ALLOWED_AVATAR_EXT,
+  AUTH_COOKIE, AUTH_TTL_SEC, AUTH_SECRET_RAW, AUTH_MAX_FAILS, AUTH_LOCK_MS, AUTH_MAP_MAX,
+  SESSION_SECRET, TRUST_PROXY, FORCE_SECURE_COOKIE,
+  HOST_GRACE_MS, CHAT_MIN_INTERVAL, CHAT_RATE_MAP_MAX,
+  SSE_QUEUE_MAX, SSE_TICKET_TTL_MS, SSE_TICKET_MAX,
+  TURN_LINES, RELAY_LINE, RELAY_TITLE, DEFAULT_STUN
+} = config;
 
 /* ---------------- 授信用户登录（白名单账号 + 签名 cookie） ----------------
    AUTH_USERS 格式：`用户名:密码[,用户名:密码 ...]`
@@ -25,319 +46,14 @@ const STREAM_KEY = String(process.env.STREAM_KEY || '').trim();
      sha256:<64位hex>                   ← 旧格式，仍可校验，登录成功后自动换成 scrypt
    一旦配了账号，全站（观看页 / 开播台 / 所有 API / SSE）都必须先登录。
    不配则维持旧的公开模式 + 可选开播口令，方便本机和已有部署平滑升级。 */
-function parseAuthUsers(raw) {
-  const map = new Map();
-  for (const item of String(raw || '').split(',')) {
-    const s = item.trim();
-    if (!s) continue;
-    const i = s.indexOf(':');
-    if (i <= 0) continue;
-    const name = s.slice(0, i).trim();
-    const cred = s.slice(i + 1).trim();
-    if (name && cred && !map.has(name)) map.set(name, cred);
-  }
-  return map;
-}
-const AUTH_SEED = parseAuthUsers(process.env.AUTH_USERS);
 
-/* ---------------- 可自助维护的账号库（用户名 / 密码摘要 / 头像） ----------------
-   env 的 AUTH_USERS 只是首次种子：第一次启动时写入 DATA_DIR/users.json，
-   之后以文件为唯一真相 —— 用户可在网页里改自己的账号、密码、头像。
-   元数据文件放 DATA_DIR，头像放 DATA_DIR/avatars；均限制为本地路径。 */
-const DATA_DIR = path.resolve(process.env.LUMA_DATA_DIR || path.join(__dirname, 'data'));
-const USER_FILE = path.join(DATA_DIR, 'users.json');
-const AVATAR_DIR = path.join(DATA_DIR, 'avatars');
-const USER_FILE_MAX = 2 * 1024 * 1024;
-const AVATAR_MAX_BYTES = 512 * 1024;
-const ALLOWED_AVATAR_EXT = new Set(['.png', '.jpg', '.webp']);
-/* 启动就把数据目录建好：/readyz 拿 W_OK 判断是否可写，第一次部署时目录还不存在 */
-try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (err) { /* 只读文件系统：留给 /readyz 报 */ }
+/* 账号库见 src/users.js：内存 Map + users.json 原子写，头像文件放 DATA_DIR/avatars */
 
-/* name -> { cred, avatar }，cred 为明文或 sha256:摘要；avatar 为纯文件名 `<hash>.<ext>` */
-const USER_DB = new Map();
-
-function saveUserFile() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${USER_FILE}.${process.pid}.tmp`;
-  const payload = JSON.stringify({ version: 1, users: Object.fromEntries(USER_DB) }, null, 2);
-  fs.writeFileSync(tmp, payload, { mode: 0o600 });
-  fs.renameSync(tmp, USER_FILE);
-}
-
-function loadUserFile() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(AVATAR_DIR, { recursive: true });
-  let loaded = false;
-  try {
-    const st = fs.statSync(USER_FILE);
-    if (st.size <= USER_FILE_MAX) {
-      const raw = JSON.parse(fs.readFileSync(USER_FILE, 'utf8'));
-      if (raw && raw.users && typeof raw.users === 'object' && !Array.isArray(raw.users)) {
-        for (const [name, rec] of Object.entries(raw.users)) {
-          if (!name || !rec || !rec.cred) continue;
-          const avatar = String(rec.avatar || '').replace(/^\/api\/avatar\//, '');
-          USER_DB.set(String(name).slice(0, 64), {
-            cred: String(rec.cred),
-            avatar: validAvatarFile(avatar) ? avatar : ''
-          });
-        }
-        loaded = true;
-      }
-    }
-  } catch (err) { /* 文件不存在或损坏：回退到 env 种子 */ }
-
-  if (!loaded && USER_DB.size === 0) {
-    /* 种子里写的是明文就就地哈希，别把明文落到 users.json 里 */
-    for (const [name, cred] of AUTH_SEED) {
-      USER_DB.set(name, { cred: looksHashed(cred) ? cred : hashCredentialSync(cred), avatar: '' });
-    }
-    if (USER_DB.size) {
-      try { saveUserFile(); } catch (err) { console.error('账号库初始化失败：', err.message); }
-    }
-  }
-}
-loadUserFile();
-
-/* 账号合法字符：中文 / 字母数字 / 下划线 / 连字符，2–24 字 */
-function validUserName(name) {
-  return /^[\w\u4e00-\u9fa5-]{2,24}$/.test(String(name || ''));
-}
-/* 头像文件名只允许 32位hex.扩展名，杜绝路径穿越 */
-function validAvatarFile(file) {
-  return /^[a-f0-9]{32}\.(png|jpg|webp)$/.test(String(file || ''));
-}
-/* 按文件头识别真实图片类型，不信任前端声明的 MIME */
-function sniffImage(buf) {
-  if (!buf || buf.length < 16) return '';
-  if (buf[0] === 0x89 && buf.toString('ascii', 1, 4) === 'PNG'
-    && buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a) return '.png';
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return '.jpg';
-  /* WebP: RIFF....WEBP */
-  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return '.webp';
-  return '';
-}
-function avatarUrlOf(user) {
-  const rec = USER_DB.get(user);
-  return rec && validAvatarFile(String(rec.avatar || '').replace(/^\/api\/avatar\//, ''))
-    ? `/api/avatar/${rec.avatar}` : '';
-}
-
-const AUTH_ENABLED = USER_DB.size > 0;
-const AUTH_COOKIE = 'luma_auth';
-const AUTH_TTL_SEC = Math.max(3600, Number(process.env.AUTH_TTL_SEC || 30 * 86400));
-/* 配了固定密钥，服务重启后登录态仍然有效；不配则每次重启都要重新登录。 */
-const AUTH_SECRET_RAW = String(process.env.AUTH_SECRET || '').trim();
-
-/* 主播 SSE 掉线后的宽限期：媒体连接独立于信令，SSE 断了画面还在，
-   只要主播在宽限期内重连回来，这场直播就不该被判死。 */
-const HOST_GRACE_MS = Math.max(0, Number(process.env.HOST_GRACE_MS || 10000));
-
-const CHAT_MIN_INTERVAL = Math.max(0, Number(process.env.CHAT_MIN_INTERVAL || 350));
-const CHAT_RATE_MAP_MAX = 1000;
-
-/* 口令尝试限速：按来源 IP 计数，连续失败若干次锁一段时间。
-   公网上的 /api/auth 和 host 的 SSE 连接都算一次尝试，防止离线爆破。 */
-const AUTH_MAX_FAILS = Math.max(1, Number(process.env.AUTH_MAX_FAILS || 5));
-const AUTH_LOCK_MS = Math.max(0, Number(process.env.AUTH_LOCK_MS || 60_000));
-const AUTH_MAP_MAX = 1000;
-/* 默认只认 socket 地址（伪造不了）。跑在 Caddy / Nginx / 平台反代后面时
-   所有请求的来源都是代理本身，要设 TRUST_PROXY=1 才读 X-Forwarded-For。 */
-const TRUST_PROXY = process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true';
-
-/* ---------------- TURN 线路（全部可选，不配就完全走 STUN 直连） ----------------
-   一条线路 = 一个 TURN 入口。TURN_LINES 用 `id|host|port|secret|标题` 描述，
-   多条用逗号分隔；secret 留空表示匿名中继。p2p 是内置线路：
-   只下发 STUN、不给任何 TURN，通不通全看两边能不能打洞。
-   凭证按 coturn 的 REST 方式（static-auth-secret）用 HMAC-SHA1 现签，6 小时有效。 */
-const TURN_TTL_SEC = 6 * 60 * 60;
-const TURN_USER = 'luma';
-
-function parseTurnLines(raw) {
-  return String(raw || '')
-    .split(',')
-    .map((x) => x.trim())
-    .filter(Boolean)
-    .map((x) => {
-      const [id, host, port, secret, title] = x.split('|').map((v) => String(v || '').trim());
-      return { id: id || host, host, port: port || '3478', secret, title: title || id || host };
-    })
-    .filter((l) => l.host);
-}
-
-const TURN_LINES = parseTurnLines(process.env.TURN_LINES);
-
-/* 兼容老部署：只配了 TURN_HOST / TURN_EXTRA 时，把它们转成线路 */
-const TURN_HOST = String(process.env.TURN_HOST || '').trim();
-const TURN_PORT = String(process.env.TURN_PORT || '3478').trim();
-const TURN_STATIC_AUTH_SECRET = String(process.env.TURN_STATIC_AUTH_SECRET || '').trim();
-const TURN_LABEL = String(process.env.TURN_LABEL || '').trim();
-if (!TURN_LINES.length && TURN_HOST) {
-  TURN_LINES.push({
-    id: 'main', host: TURN_HOST, port: TURN_PORT,
-    secret: TURN_STATIC_AUTH_SECRET, title: TURN_LABEL || '主线路'
-  });
-  for (const raw of String(process.env.TURN_EXTRA || '').split(',')) {
-    const [host, port, secret, label] = raw.split(':');
-    if (!host || !host.trim()) continue;
-    const id = (label || host).trim();
-    TURN_LINES.push({
-      id, host: host.trim(), port: (port || '3478').trim(),
-      secret: (secret || '').trim(), title: id
-    });
-  }
-}
-
-/* 默认线路：TURN_DEFAULT 填线路 id；不设就用第一条 TURN 线路（没有就是 p2p） */
-const TURN_DEFAULT = String(process.env.TURN_DEFAULT || '').trim();
-/* 中继线路固定为配置里的第一条（当前只有西安一台）。
-   名字交给 TURN_LINES 的标题决定，代码里不再写死城市名——换机房只改环境变量。 */
-const RELAY_LINE = TURN_LINES[0] || null;
-const RELAY_TITLE = (RELAY_LINE && RELAY_LINE.title) || '中继';
-
-/* 不再保留默认兜底：只有一条 relay 线路，失败就停在未连接，不换路。 */
-const DEFAULT_STUN = [];
-
-/* ------------------------------------------------------------------ *
- * 内存状态（直播间是实时的，重启即清空，符合直播语义）
- * ------------------------------------------------------------------ */
-
-/* 昵称配色跟随主站：墨黑 / 朱红 / 灰阶 */
-const PALETTE = [
-  '#111111', '#e8462f', '#4a4a4a', '#8a8a86', '#c6371f',
-  '#2c2c2c', '#6b6b66', '#a5a5a0', '#7a3b30', '#3f3f3c'
-];
-
-const SESSION_SECRET = AUTH_SECRET_RAW
-  ? crypto.createHash('sha256').update(`luma-session\0${AUTH_SECRET_RAW}`).digest()
-  : crypto.randomBytes(32);
-const SSE_QUEUE_MAX = 256 * 1024;
-const clients = new Map(); // id -> { id, role, session, res, name, joinedAt }
-
-/* SSE 短期票据：EventSource 不能带 body，开播口令不能放在 URL 里（会进反代日志）。
-   改成「先 POST 换一张 60 秒、一次性的票据，再拼进 SSE 的 query」。
-   票据绑定 role + 连接 id，用过即焚，泄漏窗口只有一个握手。 */
-const SSE_TICKET_TTL_MS = 60 * 1000;
-const SSE_TICKET_MAX = 200;
-const sseTickets = new Map(); // token -> { role, id, session, user, exp }
-
-function issueSseTicket(role, id, session, user) {
-  const token = crypto.randomBytes(24).toString('base64url');
-  const now = Date.now();
-  for (const [k, v] of sseTickets) if (v.exp <= now) sseTickets.delete(k);
-  while (sseTickets.size >= SSE_TICKET_MAX) {
-    const oldest = sseTickets.keys().next().value;
-    sseTickets.delete(oldest);
-  }
-  sseTickets.set(token, { role, id, session, user: user || '', exp: now + SSE_TICKET_TTL_MS });
-  return token;
-}
-
-function takeSseTicket(token, role, id) {
-  const key = String(token || '');
-  if (!key) return null;
-  const t = sseTickets.get(key);
-  if (!t) return null;
-  sseTickets.delete(key); /* 一次性：不管后面校验过不过，都用掉了 */
-  if (t.exp <= Date.now()) return null;
-  if (role && t.role !== role) return null;
-  if (id && t.id !== id) return null;
-  return t;
-}
-/* 账号 -> 当前活跃连接 id。登录模式下同一账号同时只能有一处（看或播），
-   新连接上线会把旧连接踢下线，防止账号泄露后被多处滥用。
-   未启用登录时不写入（name 来自 query，不可信，也就无从谈账号唯一）。 */
-const accountConns = new Map();
-const chatLog = [];        // 最近 120 条
-let chatSeq = 0;
-/* 限速键是「连接」，不是昵称：换昵称绕不过去，连接断开后由宽限期清扫 */
-const lastChatAt = new Map();
-
-const stream = {
-  live: false,
-  title: '在代码与夜色之间 · 独立开发的第 100 天',
-  streamer: 'Luma',
-  bio: '',
-  muted: { audio: false, video: false },
-  startedAt: null,
-  hostId: null
-};
-
-/* host 断线宽限期的运行态 */
-let hostGraceTimer = null;
-let hostGraceUntil = 0;
-
-/* 被顶替过的 host id。
-   只切断旧连接是不够的：旧页面上的 EventSource 会自动重连，一回来又把
-   新的顶掉，于是两个开播台每 2~3 秒互相踢一次，观众端的 offer 永远被打断，
-   表现就是「直播中但一直黑屏」。
-   这里记住「被谁顶下去的」，只要当前主播还活着就不许它再抢；
-   当前主播下线后名单作废（可能确实是换回来）。 */
-const supersededHosts = new Map(); // id -> ts
-const SUPERSEDED_MAX = 200;
-
-function noteSuperseded(id) {
-  if (!id) return;
-  supersededHosts.delete(id);
-  supersededHosts.set(id, Date.now());
-  if (supersededHosts.size > SUPERSEDED_MAX) {
-    for (const k of supersededHosts.keys()) {
-      supersededHosts.delete(k);
-      if (supersededHosts.size <= SUPERSEDED_MAX / 2) break;
-    }
-  }
-}
-
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2'
-};
 
 /* ------------------------------------------------------------------ *
  * helpers
  * ------------------------------------------------------------------ */
 
-function colorFor(name) {
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-  return PALETTE[h % PALETTE.length];
-}
-
-/* 定时比较，避免逐字符短路泄漏口令长度/前缀 */
-function safeEqual(a, b) {
-  const x = Buffer.from(String(a), 'utf8');
-  const y = Buffer.from(String(b), 'utf8');
-  if (x.length !== y.length) return false;
-  try { return crypto.timingSafeEqual(x, y); } catch (err) { return false; }
-}
-
-/* 一个请求可能同时种 session 和 auth 两个 cookie，append 而不是覆盖。 */
-function addCookie(res, line) {
-  const prev = res.getHeader('Set-Cookie');
-  if (!prev) res.setHeader('Set-Cookie', line);
-  else if (Array.isArray(prev)) res.setHeader('Set-Cookie', prev.concat(line));
-  else res.setHeader('Set-Cookie', [prev, line]);
-}
-
-/* 对外恒为 HTTPS 的部署（如 CDN 回源走 HTTP 的 Flexible SSL）可强制加 Secure，
-   不依赖回源协商出来的 X-Forwarded-Proto。 */
-const FORCE_SECURE_COOKIE = process.env.COOKIE_SECURE === '1' || process.env.COOKIE_SECURE === 'true';
-
-function secureCookie(req) {
-  if (FORCE_SECURE_COOKIE) return true;
-  if (req.socket.encrypted) return true;
-  if (TRUST_PROXY) {
-    const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
-    if (proto === 'https') return true;
-  }
-  return false;
-}
 
 function sessionOf(req, res) {
   const cookie = String(req.headers.cookie || '').split(';').map((s) => s.trim())
@@ -356,67 +72,7 @@ function keyOk(candidate) {
   return safeEqual(candidate, STREAM_KEY);
 }
 
-/* ---------------- 密码存储：scrypt ----------------
-   sha256 单轮扛不住 GPU 字典，这里换成带随机盐的 scrypt。
-   旧记录（sha256: 或明文）仍能登录，成功后就地升级，不需要用户改密码。 */
-const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64, salt: 16 };
-const SCRYPT_RE = /^scrypt:(\d+):(\d+):(\d+):([a-f0-9]{16,128}):([a-f0-9]{32,256})$/i;
-
-function scryptEncode(pass, salt) {
-  const key = crypto.scryptSync(String(pass), salt, SCRYPT.keylen,
-    { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p });
-  return `scrypt:${SCRYPT.N}:${SCRYPT.r}:${SCRYPT.p}:${salt.toString('hex')}:${key.toString('hex')}`;
-}
-
-/* 同步版只用在启动种子（一次性，用户数量很少） */
-function hashCredentialSync(pass) {
-  return scryptEncode(pass, crypto.randomBytes(SCRYPT.salt));
-}
-
-/* 异步版给登录改写用：不让 scrypt 的计算卡住事件循环 */
-function hashCredential(pass) {
-  const salt = crypto.randomBytes(SCRYPT.salt);
-  return new Promise((resolve, reject) => {
-    crypto.scrypt(String(pass), salt, SCRYPT.keylen,
-      { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p }, (err, key) => {
-        if (err) return reject(err);
-        resolve(`scrypt:${SCRYPT.N}:${SCRYPT.r}:${SCRYPT.p}:${salt.toString('hex')}:${key.toString('hex')}`);
-      });
-  });
-}
-
-function looksHashed(cred) {
-  return SCRYPT_RE.test(String(cred || '')) || /^sha256:[a-f0-9]{64}$/i.test(String(cred || ''));
-}
-
-/* 返回 { ok, legacy }：legacy=true 表示这条记录还是旧格式，登录后应升级 */
-function verifyCredential(stored, input) {
-  const s = String(stored || '');
-  const m = SCRYPT_RE.exec(s);
-  if (m) {
-    const N = Number(m[1]);
-    const r = Number(m[2]);
-    const p = Number(m[3]);
-    const salt = Buffer.from(m[4], 'hex');
-    const want = Buffer.from(m[5], 'hex');
-    return new Promise((resolve) => {
-      crypto.scrypt(String(input || ''), salt, want.length, { N, r, p }, (err, key) => {
-        if (err) return resolve({ ok: false, legacy: false });
-        resolve({ ok: safeEqual(key.toString('hex'), want.toString('hex')), legacy: false });
-      });
-    });
-  }
-  const legacySha = /^sha256:([a-f0-9]{64})$/i.exec(s);
-  if (legacySha) {
-    const got = crypto.createHash('sha256').update(String(input || ''), 'utf8').digest('hex');
-    return Promise.resolve({ ok: safeEqual(got, legacySha[1].toLowerCase()), legacy: true });
-  }
-  /* 还没升级的老部署：明文口令 */
-  return Promise.resolve({ ok: Boolean(s) && safeEqual(String(input || ''), s), legacy: Boolean(s) });
-}
-
-/* 账号不存在时也走一次同样耗时的校验，避免用响应时间枚举用户名 */
-const DUMMY_CRED = hashCredentialSync(crypto.randomBytes(16).toString('hex'));
+/* 密码摘要实现见 src/password.js（scrypt + 老格式透明升级） */
 
 /* cookie: base64url(用户名).过期秒.签名。签名覆盖用户名+过期+凭证摘要，
    所以管理员改了某人的密码，旧 cookie 立即失效，不用等它过期。 */
@@ -516,296 +172,18 @@ function tooMany(res, leftMs) {
  * ------------------------------------------------------------------ */
 
 /* 单条线路的 iceServers 条目；凭证按 coturn REST 方式现签 */
-function turnEntry(host, port, secret) {
-  /* coturn 与 TURN 共用同一端口，顺手当 STUN 用：部分网络里 Google 的 STUN 不可达 */
-  const urls = [
-    `turn:${host}:${port}?transport=udp`,
-    `turn:${host}:${port}?transport=tcp`
-  ];
-  const entry = { urls };
-  if (secret) {
-    /* coturn REST 凭证：username = "<过期时间戳>:<用户名>"，
-       credential = base64(HMAC-SHA1(secret, username))。两端 secret 必须一致。 */
-    const username = `${Math.floor(Date.now() / 1000) + TURN_TTL_SEC}:${TURN_USER}`;
-    entry.username = username;
-    entry.credential = crypto.createHmac('sha1', secret).update(username).digest('base64');
-  }
-  return entry;
-}
+/* TURN 线路与凭证见 src/turn.js */
 
-/* 页面固定使用唯一的中继线路；此清单仅供状态提示标注节点名，不提供线路切换。 */
-function lineOptions() {
-  return RELAY_LINE ? [{ id: RELAY_LINE.id, title: RELAY_TITLE, host: RELAY_LINE.host }] : [];
-}
-
-function findLine(id) {
-  const want = String(id || '').trim().toLowerCase();
-  if (!want) return null;
-  return TURN_LINES.find((l) => l.id.toLowerCase() === want) || null;
-}
-
-function defaultLine() {
-  if (TURN_DEFAULT) {
-    const hit = findLine(TURN_DEFAULT);
-    if (hit) return hit;
-  }
-  return TURN_LINES[0] || null;
-}
-
-/* 忽略客户端旧版本携带的线路参数：始终固定唯一中继线路，绝不回退到其它节点。 */
-function pickLine() {
-  return RELAY_LINE;
-}
-
-function icePayload() {
-  const line = pickLine();
-  const servers = line
-    ? [turnEntry(line.host, line.port, line.secret)]
-    : [];
-  return {
-    iceServers: servers,
-    ttl: TURN_TTL_SEC,
-    iceTransportPolicy: 'relay',
-    line: line ? line.id : '',
-    lines: lineOptions()
-  };
-}
-
-function clearHostGrace() {
-  if (hostGraceTimer) {
-    clearTimeout(hostGraceTimer);
-    hostGraceTimer = null;
-  }
-  hostGraceUntil = 0;
-}
-
-/* 主播掉线：先不判死，给 10 秒重连窗口 */
-function startHostGrace() {
-  clearHostGrace();
-  if (!HOST_GRACE_MS) {
-    stream.live = false;
-    stream.startedAt = null;
-    broadcast('stream-ended', { reason: 'host-disconnected' });
-    broadcastState(true);
-    return;
-  }
-  hostGraceUntil = Date.now() + HOST_GRACE_MS;
-  hostGraceTimer = setTimeout(() => {
-    hostGraceTimer = null;
-    hostGraceUntil = 0;
-    if (stream.hostId || !stream.live) {
-      broadcastState(true);
-      return;
-    }
-    stream.live = false;
-    stream.startedAt = null;
-    broadcast('stream-ended', { reason: 'host-disconnected' });
-    broadcastState(true);
-  }, HOST_GRACE_MS);
-  if (hostGraceTimer.unref) hostGraceTimer.unref();
-}
-
-function viewerCount() {
-  let n = 0;
-  for (const c of clients.values()) if (c.role === 'viewer') n++;
-  return n;
-}
-
-/* 主播要给每个观众单独建 peer，所以除了 id 还要带它当前选的线路。 */
-function viewerDescriptors() {
-  const out = [];
-  for (const c of clients.values()) {
-    if (c.role === 'viewer') out.push({ id: c.id, line: c.line || 'p2p' });
-  }
-  return out;
-}
-
-/* 在场名单：当前所有连接（主播+观众）的显示名，按加入时间排序、去重。
-   前端据此列出「谁在看」，同账号单连接后一个名字最多出现一次。 */
-function audienceList() {
-  const seen = new Set();
-  const out = [];
-  const sorted = [...clients.values()].sort((a, b) => a.joinedAt - b.joinedAt);
-  for (const c of sorted) {
-    if (!c.name || seen.has(c.name)) continue;
-    seen.add(c.name);
-    out.push({ name: c.name, role: c.role, avatar: avatarUrlOf(c.name) });
-  }
-  return out;
-}
-
-function statePayload() {
-  return {
-    live: stream.live,
-    title: stream.title,
-    streamer: stream.streamer,
-    streamerAvatar: avatarUrlOf(stream.streamer),
-    bio: stream.bio,
-    muted: stream.muted,
-    startedAt: stream.startedAt,
-    viewers: viewerCount(),
-    audience: audienceList(),
-    hostOnline: Boolean(stream.hostId),
-    /* 当前中继线路：前端「线路」栏数据驱动显示，不写死城市名。
-       未来增加中转服务器只需往 TURN_LINES 追加，这里自动跟着变。 */
-    line: RELAY_LINE
-      ? { id: RELAY_LINE.id, title: RELAY_TITLE, host: RELAY_LINE.host }
-      : null,
-    /* 主播信令断了但还没过宽限期：观众端提示「正在重连」，不要直接判死 */
-    hostReconnecting: hostGraceUntil > Date.now()
-  };
-}
-
-function writeSse(res, frame) {
-  if (res.destroyed || res.writableEnded) return false;
-  if (res.writableLength + Buffer.byteLength(frame) > SSE_QUEUE_MAX) {
-    res.destroy();
-    return false;
-  }
-  try {
-    res.write(frame);
-    return true;
-  } catch (err) {
-    res.destroy();
-    return false;
-  }
-}
-
-function sendTo(id, event, data) {
-  const c = clients.get(id);
-  if (!c) return false;
-  return writeSse(c.res, `event: ${event}\ndata: ${JSON.stringify(data === undefined ? {} : data)}\n\n`);
-}
-
-function broadcast(event, data, exceptId) {
-  const frame = `event: ${event}\ndata: ${JSON.stringify(data === undefined ? {} : data)}\n\n`;
-  for (const c of clients.values()) {
-    if (c.id === exceptId) continue;
-    writeSse(c.res, frame);
-  }
-}
 
 /* 状态广播做合并：观众成批涌入时（一次转发带来几十个新连接），
    每个连接都广播一次会变成 O(N²) 写入。这里把窗口内的多次请求
    合并成一帧，延迟 200ms 完全不影响观感。 */
-let stateTimer = null;
 
-function broadcastState(immediate) {
-  if (immediate) {
-    flushState();
-    return;
-  }
-  if (stateTimer) return;
-  stateTimer = setTimeout(() => {
-    stateTimer = null;
-    flushState();
-  }, 200);
-  if (stateTimer.unref) stateTimer.unref();
-}
-
-function flushState() {
-  if (!clients.size) return;
-  broadcast('state', statePayload());
-}
-
-function json(res, code, obj, headers) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, Object.assign({
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-    'Content-Length': Buffer.byteLength(body)
-  }, headers || {}));
-  res.end(body);
-}
-
-function readBody(req, limit = 96 * 1024) {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    let settled = false;
-    const chunks = [];
-    const fail = (err) => {
-      if (settled) return;
-      settled = true;
-      chunks.length = 0;
-      reject(err);
-    };
-    req.on('data', (chunk) => {
-      if (settled) return;
-      size += chunk.length;
-      if (size > limit) {
-        fail(new Error('payload too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      if (settled) return;
-      const raw = Buffer.concat(chunks).toString('utf8');
-      chunks.length = 0;
-      try {
-        const body = raw ? JSON.parse(raw) : {};
-        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('expected object');
-        settled = true;
-        resolve(body);
-      } catch (err) {
-        fail(err);
-      }
-    });
-    req.on('error', fail);
-    req.on('aborted', () => fail(new Error('request aborted')));
-  });
-}
 
 /* ------------------------------------------------------------------ *
  * SSE
  * ------------------------------------------------------------------ */
 
-/* 所有连接共用一个心跳定时器：N 个连接 N 个 timer 是纯浪费 */
-let heartbeat = null;
-
-function startHeartbeat() {
-  if (heartbeat) return;
-  heartbeat = setInterval(() => {
-    for (const c of clients.values()) {
-      writeSse(c.res, ': ping\n\n');
-    }
-  }, 20000);
-  heartbeat.unref();
-}
-
-/* 账号级单连接：一个授信账号同时只允许一个活动连接（看或播都算）。
-   新连接上线时把同账号的旧连接踢掉，旧页面收到 account-taken 会停播/停看
-   且不再自动重连，避免账号泄露后被多处滥用。未启用登录时不生效。 */
-function evictAccount(user, keepId) {
-  if (!user) return;
-  const oldId = accountConns.get(user);
-  if (!oldId || oldId === keepId) return;
-  accountConns.delete(user);
-  const stale = clients.get(oldId);
-  if (!stale) return;
-
-  sendTo(oldId, 'account-taken', { by: keepId, at: Date.now() });
-  try { stale.res.end(); } catch (err) { /* noop */ }
-  clients.delete(oldId);
-  lastChatAt.delete(`c:${oldId}`);
-
-  if (stale.role === 'host') {
-    if (stream.hostId === oldId) {
-      stream.hostId = null;
-      supersededHosts.clear();
-      clearHostGrace();
-      if (stream.live) {
-        stream.live = false;
-        stream.startedAt = null;
-        broadcast('stream-ended', { reason: 'account-taken' });
-      }
-    }
-  } else if (stream.hostId) {
-    sendTo(stream.hostId, 'viewer-left', { id: oldId });
-  }
-  broadcastState(true);
-}
 
 function handleEvents(req, res, url) {
   const id = (url.searchParams.get('id') || '').slice(0, 64);
@@ -976,38 +354,6 @@ function handleEvents(req, res, url) {
  * 静态文件
  * ------------------------------------------------------------------ */
 
-function serveStatic(req, res, url) {
-  let pathname;
-  try { pathname = decodeURIComponent(url.pathname); } catch (err) {
-    return json(res, 400, { error: 'bad URI' });
-  }
-  if (pathname.includes('\0')) return json(res, 400, { error: 'bad URI' });
-
-  if (pathname === '/' || pathname === '/index.html') pathname = '/index.html';
-  else if (pathname === '/studio' || pathname === '/studio/') pathname = '/studio.html';
-  else if (pathname === '/login' || pathname === '/login/') pathname = '/login.html';
-
-  const filePath = path.resolve(PUBLIC_DIR, `.${pathname}`);
-  const relative = path.relative(PUBLIC_DIR, filePath);
-  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    res.writeHead(403).end('forbidden');
-    return;
-  }
-
-  fs.readFile(filePath, (err, data) => {
-    if (err) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('404');
-      return;
-    }
-    const ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, {
-      'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Cache-Control': ext === '.html' ? 'no-store' : 'public, max-age=120'
-    });
-    res.end(data);
-  });
-}
 
 /* ------------------------------------------------------------------ *
  * API
@@ -1330,7 +676,7 @@ async function handleApi(req, res, url) {
     }
 
     const msg = {
-      id: `m${++chatSeq}`,
+      id: `m${nextChatSeq()}`,
       name: shownName,
       avatar: avatarUrlOf(shownName),
       text,
@@ -1406,67 +752,8 @@ async function handleApi(req, res, url) {
 }
 
 /* ------------------------------------------------------------------ *
- * 安全响应头 / 跨站写请求闸门 / 健康检查
+ * 就绪检查（安全响应头与跨站校验见 src/http.js）
  * ------------------------------------------------------------------ */
-
-/* 页面里没有内联脚本，所以 script-src 不用开 unsafe-inline；
-   style 与字体得放开：界面用 style 标签排版，中文走 npmmirror 的文楷。 */
-const CSP = [
-  "default-src 'self'",
-  "base-uri 'self'",
-  "object-src 'none'",
-  "frame-ancestors 'none'",
-  "form-action 'self'",
-  "style-src 'self' 'unsafe-inline' https://registry.npmmirror.com",
-  "font-src 'self' data: https://registry.npmmirror.com",
-  "script-src 'self'",
-  "img-src 'self' data: blob:",
-  "media-src 'self' blob: data:",
-  "connect-src 'self'"
-].join('; ');
-
-const PERMISSIONS_POLICY = [
-  'camera=(self)', 'microphone=(self)', 'display-capture=(self)',
-  'geolocation=()', 'payment=()', 'usb=()'
-].join(', ');
-
-function isHttps(req) {
-  if (req.socket && req.socket.encrypted) return true;
-  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-  return proto === 'https';
-}
-
-function applySecurityHeaders(req, res) {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Content-Security-Policy', CSP);
-  res.setHeader('Permissions-Policy', PERMISSIONS_POLICY);
-  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-  /* 只在确实跑在 HTTPS 上时才发 HSTS：源站走 http 反代时发它会把用户锁死 */
-  if (isHttps(req)) {
-    res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
-  }
-}
-
-/* Cookie 已经是 SameSite=Strict，跨站请求本来带不上。
-   这里再挡一层显式带着别人的 Origin/Referer 来的写请求，防止反代或老浏览器把 SameSite 丢掉。
-   两个头都没有（curl、同源表单、部分旧浏览器）就放行，交给 cookie 兜底。 */
-const UNSAFE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-
-function crossSiteWrite(req, pathname) {
-  if (!UNSAFE_METHODS.has(req.method)) return false;
-  if (!pathname.startsWith('/api/')) return false;
-  const source = req.headers.origin || req.headers.referer || '';
-  if (!source) return false;
-  const host = String(req.headers.host || '').toLowerCase();
-  try {
-    return new URL(source).host.toLowerCase() !== host;
-  } catch (err) {
-    return true; /* Origin: null 之类解析不了的头，直接按跨站处理 */
-  }
-}
 
 function readiness() {
   const checks = {};
@@ -1545,6 +832,7 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname.startsWith('/api/')) {
     handleApi(req, res, url).catch((err) => {
+      if (process.env.LUMA_DEBUG) console.error('[api]', err);
       if (!res.headersSent) json(res, 500, { error: 'server error' });
     });
     return;
@@ -1571,15 +859,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   logSync(`收到 ${signal}，开始优雅退出（在线连接 ${clients.size} 个）`);
-  broadcast('server-shutdown', { reason: 'restart', at: Date.now() });
-  for (const c of clients.values()) {
-    try { c.res.end(); } catch (err) { /* noop */ }
-  }
-  clients.clear();
-  accountConns.clear();
-  if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
-  if (stateTimer) { clearTimeout(stateTimer); stateTimer = null; }
-  if (hostGraceTimer) { clearTimeout(hostGraceTimer); hostGraceTimer = null; }
+  closeAll();
   server.close(() => process.exit(0));
   const force = setTimeout(() => process.exit(0), 2000);
   if (force.unref) force.unref();
