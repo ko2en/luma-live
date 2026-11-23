@@ -1325,10 +1325,42 @@
     }
 
     const q = `role=host&id=${encodeURIComponent(hostId)}&name=Luma`;
-    /* TODO(安全)：EventSource 不能带 body，口令只能留在 query 里，会进反代访问日志。
-       等接上「/api/auth 换短期 token → SSE 带 token」后改成 token。 */
+
+    /* EventSource 不能带 body，口令不能留在 URL 里（会进反代访问日志）。
+       先 POST 换一张 60 秒、一次性的票据，再拼进 query。
+       没有口令的部署（纯登录 / 完全开放）同样走票据，行为统一。 */
+    let ticket = '';
+    {
+      let r;
+      try {
+        r = await post('/api/sse-ticket', { role: 'host', id: hostId, key: streamKey });
+      } catch (err) {
+        toast('网络错误，稍后自动重试');
+        return;
+      }
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (r.status === 401) {
+          setKeyState('口令不对', 'bad');
+          toast('开播口令不正确');
+        } else if (r.status === 429) {
+          const wait = Number(data.retryAfter) || 60;
+          setKeyState(`${wait} 秒后重试`, 'bad');
+          toast(`口令尝试太频繁，${wait} 秒后自动重试`);
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(connect, wait * 1000);
+        } else {
+          toast('拿不到开播票据，请刷新页面');
+        }
+        return;
+      }
+      ticket = data.ticket || '';
+      if (!ticket) { toast('拿不到开播票据，请刷新页面'); return; }
+    }
+
     const tk = takeover ? '&takeover=1' : '';
-    es = new EventSource(`/api/events?${q}&key=${encodeURIComponent(streamKey)}${tk}`);
+    const tq = ticket ? `&ticket=${encodeURIComponent(ticket)}` : '';
+    es = new EventSource(`/api/events?${q}${tq}${tk}`);
 
     /* 服务端切断这条连接之前会先发这一帧：说明不是网络抖动，是被接管了 */
     es.addEventListener('host-taken', () => handleHostTaken());

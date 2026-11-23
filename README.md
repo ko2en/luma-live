@@ -156,7 +156,8 @@ flowchart LR
 - **媒体**：主播为每位观众建立独立 WebRTC 连接；服务端只负责信令和配置，不处理媒体转码。
 - **强制中继**：浏览器使用 `iceTransportPolicy: relay`，`iceServers` 只下发配置的 TURN（UDP + TCP）。中继不可用时直接失败。
 - **临时凭证**：coturn REST 凭证由服务端现签，客户端只拿到限时凭证。
-- **账号安全**：登录 cookie 为 HttpOnly；失败次数按来源 IP 限制，连续失败达到阈值后暂时锁定。
+- **账号安全**：密码用 scrypt（随机盐）存储，旧的 `sha256:` 或明文记录在成功登录后自动升级；登录 cookie 为 HttpOnly + SameSite=Strict；失败次数按来源 IP 限制，连续失败达到阈值后暂时锁定。
+- **口令不进 URL**：开播端先用 `POST /api/sse-ticket` 把口令换成 60 秒一次性票据，再拼进 SSE 的 query，口令只出现在请求体里，不会落到反代访问日志。
 - **重连与接管**：主播信令断开后进入宽限期；新开播台接管时，旧页面收到 `host-taken` 后停止推流和自动重连。
 
 ## 设计取舍
@@ -177,7 +178,7 @@ flowchart LR
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
 | `PORT` | `3000` | 应用监听端口 |
-| `AUTH_USERS` | 空 | 初始账号：`用户名:密码[,用户名:密码...]`，首次启动写入 `data/users.json` |
+| `AUTH_USERS` | 空 | 初始账号：`用户名:密码[,用户名:密码...]`，首次启动写入 `data/users.json`；密码可写明文或 `node scripts/hash-pass.js 密码` 生成的 scrypt 摘要 |
 | `AUTH_SECRET` | 空 | 会话签名密钥；不设置时重启后需重新登录 |
 | `AUTH_TTL_SEC` | `2592000` | 登录有效期（秒，最小 1 小时） |
 | `AUTH_MAX_FAILS` | `5` | 连续登录失败次数阈值 |
@@ -208,6 +209,7 @@ npm run test:relay    # relay 候选与中继识别
 npm run test:e2e      # 开播、观看、刷新重连
 npm run test:studio   # 开播口令流程
 npm run doctor        # 部署自检：Node 版本、数据目录、账号、TURN、端口占用
+node scripts/hash-pass.js '密码'   # 生成可写进 AUTH_USERS 的 scrypt 摘要
 ```
 
 > 测试通过仅表示相应自动化场景通过，不等价于跨浏览器、跨网络或生产容量认证。

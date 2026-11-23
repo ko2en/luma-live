@@ -20,8 +20,9 @@ const STREAM_KEY = String(process.env.STREAM_KEY || '').trim();
 
 /* ---------------- 授信用户登录（白名单账号 + 签名 cookie） ----------------
    AUTH_USERS 格式：`用户名:密码[,用户名:密码 ...]`
-   密码可以写明文，也可以写 sha256 摘要（`sha256:<64位hex>`，
-   用 `node scripts/hash-pass.js 明文` 生成）。摘要方式避免配置里出现明文。
+   密码可以写明文，也可以写摘要（`node scripts/hash-pass.js 明文` 生成）：
+     scrypt:<N>:<r>:<p>:<salt>:<hash>   ← 当前算法，首次启动/登录时自动升级到这里
+     sha256:<64位hex>                   ← 旧格式，仍可校验，登录成功后自动换成 scrypt
    一旦配了账号，全站（观看页 / 开播台 / 所有 API / SSE）都必须先登录。
    不配则维持旧的公开模式 + 可选开播口令，方便本机和已有部署平滑升级。 */
 function parseAuthUsers(raw) {
@@ -86,7 +87,10 @@ function loadUserFile() {
   } catch (err) { /* 文件不存在或损坏：回退到 env 种子 */ }
 
   if (!loaded && USER_DB.size === 0) {
-    for (const [name, cred] of AUTH_SEED) USER_DB.set(name, { cred, avatar: '' });
+    /* 种子里写的是明文就就地哈希，别把明文落到 users.json 里 */
+    for (const [name, cred] of AUTH_SEED) {
+      USER_DB.set(name, { cred: looksHashed(cred) ? cred : hashCredentialSync(cred), avatar: '' });
+    }
     if (USER_DB.size) {
       try { saveUserFile(); } catch (err) { console.error('账号库初始化失败：', err.message); }
     }
@@ -208,6 +212,37 @@ const SESSION_SECRET = AUTH_SECRET_RAW
   : crypto.randomBytes(32);
 const SSE_QUEUE_MAX = 256 * 1024;
 const clients = new Map(); // id -> { id, role, session, res, name, joinedAt }
+
+/* SSE 短期票据：EventSource 不能带 body，开播口令不能放在 URL 里（会进反代日志）。
+   改成「先 POST 换一张 60 秒、一次性的票据，再拼进 SSE 的 query」。
+   票据绑定 role + 连接 id，用过即焚，泄漏窗口只有一个握手。 */
+const SSE_TICKET_TTL_MS = 60 * 1000;
+const SSE_TICKET_MAX = 200;
+const sseTickets = new Map(); // token -> { role, id, session, user, exp }
+
+function issueSseTicket(role, id, session, user) {
+  const token = crypto.randomBytes(24).toString('base64url');
+  const now = Date.now();
+  for (const [k, v] of sseTickets) if (v.exp <= now) sseTickets.delete(k);
+  while (sseTickets.size >= SSE_TICKET_MAX) {
+    const oldest = sseTickets.keys().next().value;
+    sseTickets.delete(oldest);
+  }
+  sseTickets.set(token, { role, id, session, user: user || '', exp: now + SSE_TICKET_TTL_MS });
+  return token;
+}
+
+function takeSseTicket(token, role, id) {
+  const key = String(token || '');
+  if (!key) return null;
+  const t = sseTickets.get(key);
+  if (!t) return null;
+  sseTickets.delete(key); /* 一次性：不管后面校验过不过，都用掉了 */
+  if (t.exp <= Date.now()) return null;
+  if (role && t.role !== role) return null;
+  if (id && t.id !== id) return null;
+  return t;
+}
 /* 账号 -> 当前活跃连接 id。登录模式下同一账号同时只能有一处（看或播），
    新连接上线会把旧连接踢下线，防止账号泄露后被多处滥用。
    未启用登录时不写入（name 来自 query，不可信，也就无从谈账号唯一）。 */
@@ -321,15 +356,67 @@ function keyOk(candidate) {
   return safeEqual(candidate, STREAM_KEY);
 }
 
-/* ---------------- 登录账号校验与凭证 ---------------- */
+/* ---------------- 密码存储：scrypt ----------------
+   sha256 单轮扛不住 GPU 字典，这里换成带随机盐的 scrypt。
+   旧记录（sha256: 或明文）仍能登录，成功后就地升级，不需要用户改密码。 */
+const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64, salt: 16 };
+const SCRYPT_RE = /^scrypt:(\d+):(\d+):(\d+):([a-f0-9]{16,128}):([a-f0-9]{32,256})$/i;
 
-function credentialOk(stored, input) {
-  const m = /^sha256:([a-f0-9]{64})$/i.exec(String(stored || ''));
-  const got = m
-    ? crypto.createHash('sha256').update(String(input || ''), 'utf8').digest('hex')
-    : String(input || '');
-  return safeEqual(got, m ? m[1].toLowerCase() : String(stored || ''));
+function scryptEncode(pass, salt) {
+  const key = crypto.scryptSync(String(pass), salt, SCRYPT.keylen,
+    { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p });
+  return `scrypt:${SCRYPT.N}:${SCRYPT.r}:${SCRYPT.p}:${salt.toString('hex')}:${key.toString('hex')}`;
 }
+
+/* 同步版只用在启动种子（一次性，用户数量很少） */
+function hashCredentialSync(pass) {
+  return scryptEncode(pass, crypto.randomBytes(SCRYPT.salt));
+}
+
+/* 异步版给登录改写用：不让 scrypt 的计算卡住事件循环 */
+function hashCredential(pass) {
+  const salt = crypto.randomBytes(SCRYPT.salt);
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(String(pass), salt, SCRYPT.keylen,
+      { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p }, (err, key) => {
+        if (err) return reject(err);
+        resolve(`scrypt:${SCRYPT.N}:${SCRYPT.r}:${SCRYPT.p}:${salt.toString('hex')}:${key.toString('hex')}`);
+      });
+  });
+}
+
+function looksHashed(cred) {
+  return SCRYPT_RE.test(String(cred || '')) || /^sha256:[a-f0-9]{64}$/i.test(String(cred || ''));
+}
+
+/* 返回 { ok, legacy }：legacy=true 表示这条记录还是旧格式，登录后应升级 */
+function verifyCredential(stored, input) {
+  const s = String(stored || '');
+  const m = SCRYPT_RE.exec(s);
+  if (m) {
+    const N = Number(m[1]);
+    const r = Number(m[2]);
+    const p = Number(m[3]);
+    const salt = Buffer.from(m[4], 'hex');
+    const want = Buffer.from(m[5], 'hex');
+    return new Promise((resolve) => {
+      crypto.scrypt(String(input || ''), salt, want.length, { N, r, p }, (err, key) => {
+        if (err) return resolve({ ok: false, legacy: false });
+        resolve({ ok: safeEqual(key.toString('hex'), want.toString('hex')), legacy: false });
+      });
+    });
+  }
+  const legacySha = /^sha256:([a-f0-9]{64})$/i.exec(s);
+  if (legacySha) {
+    const got = crypto.createHash('sha256').update(String(input || ''), 'utf8').digest('hex');
+    return Promise.resolve({ ok: safeEqual(got, legacySha[1].toLowerCase()), legacy: true });
+  }
+  /* 还没升级的老部署：明文口令 */
+  return Promise.resolve({ ok: Boolean(s) && safeEqual(String(input || ''), s), legacy: Boolean(s) });
+}
+
+/* 账号不存在时也走一次同样耗时的校验，避免用响应时间枚举用户名 */
+const DUMMY_CRED = hashCredentialSync(crypto.randomBytes(16).toString('hex'));
 
 /* cookie: base64url(用户名).过期秒.签名。签名覆盖用户名+过期+凭证摘要，
    所以管理员改了某人的密码，旧 cookie 立即失效，不用等它过期。 */
@@ -742,13 +829,23 @@ function handleEvents(req, res, url) {
      登录模式下凭登录 cookie（已在全局闸门校验）；否则退回开播口令。
      失败计入 IP 限速：爆破 5 次就锁 60 秒。 */
   if (role === 'host') {
-    const left = authLockLeft(req);
-    if (left > 0) return tooMany(res, left);
-    if (!AUTH_ENABLED && !keyOk(url.searchParams.get('key') || '')) {
-      noteAuthFail(req);
-      return json(res, 401, { error: '开播口令不正确' });
+    /* 登录模式：全局闸门已经验过 cookie，这里不用再验。
+       口令模式：必须拿 POST /api/sse-ticket 换来的票据，URL 里不再接受口令。 */
+    if (!AUTH_ENABLED) {
+      const legacyKey = url.searchParams.get('key');
+      if (legacyKey) {
+        return json(res, 401, {
+          error: '开播凭证已改为短期票据，请刷新页面',
+          code: 'ticket-required'
+        });
+      }
+      const ticket = takeSseTicket(url.searchParams.get('ticket'), 'host', id);
+      if (!ticket) {
+        return json(res, 401, { error: '票据无效或已过期，请刷新页面重试', code: 'ticket-required' });
+      }
+    } else {
+      takeSseTicket(url.searchParams.get('ticket'), 'host', id); /* 有就顺手核销掉 */
     }
-    clearAuthFail(req);
 
     /* 被顶替过的开播台：当前主播还活着就直接拒掉，别让它顶回来。
        页面主动点「在这里继续开播」会带 takeover=1，那是人的明确意图。 */
@@ -934,14 +1031,20 @@ async function handleApi(req, res, url) {
     const pass = String((body && body.pass) || '');
     const cred = USER_DB.get(user) && USER_DB.get(user).cred;
 
-    /* 用户名不存在也走一次摘要比较，避免用响应耗时枚举账号。 */
-    const dummy = 'sha256:' + '0'.repeat(64);
-    const ok = credentialOk(cred || dummy, pass) && Boolean(cred);
-    if (!ok) {
+    /* 用户名不存在也走一次同样耗时的校验，避免用响应耗时枚举账号。 */
+    const chk = await verifyCredential(cred || DUMMY_CRED, pass);
+    if (!chk.ok || !cred) {
       noteAuthFail(req);
       return json(res, 401, { ok: false, error: '账号或密码不正确' });
     }
     clearAuthFail(req);
+    /* 老的 sha256 / 明文记录：登录成功即就地换成 scrypt */
+    if (chk.legacy) {
+      try {
+        USER_DB.get(user).cred = await hashCredential(pass);
+        saveUserFile();
+      } catch (err) { /* 升级失败不影响本次登录 */ }
+    }
     grantAuth(req, res, user);
     return json(res, 200, { ok: true, requireLogin: true, user });
   }
@@ -995,7 +1098,7 @@ async function handleApi(req, res, url) {
     try { body = await readBody(req); } catch (err) { return json(res, 400, { error: 'bad body' }); }
     const currentPass = String((body && body.currentPass) || '');
     const rec = USER_DB.get(user);
-    if (!credentialOk(rec.cred, currentPass)) {
+    if (!(await verifyCredential(rec.cred, currentPass)).ok) {
       noteAuthFail(req);
       return json(res, 401, { error: '当前密码不正确' });
     }
@@ -1014,7 +1117,7 @@ async function handleApi(req, res, url) {
     }
     if (wantPass && newPass.length < 6) return json(res, 400, { error: '新密码至少 6 位' });
 
-    if (wantPass) rec.cred = `sha256:${crypto.createHash('sha256').update(newPass, 'utf8').digest('hex')}`;
+    if (wantPass) rec.cred = await hashCredential(newPass);
     if (wantRename) {
       USER_DB.delete(user);
       USER_DB.set(newUser, rec);
@@ -1138,6 +1241,30 @@ async function handleApi(req, res, url) {
     }
     clearAuthFail(req);
     return json(res, 200, { ok: true, requireKey: true });
+  }
+
+  /* 用一次口令/登录态换一张 SSE 票据。口令只走 POST body，不进任何 URL。 */
+  if (req.method === 'POST' && route === '/api/sse-ticket') {
+    let body;
+    try { body = await readBody(req); } catch (err) { return json(res, 400, { error: 'bad body' }); }
+    const role = body && body.role === 'host' ? 'host' : 'viewer';
+    const id = String((body && body.id) || '').slice(0, 64);
+    if (!id) return json(res, 400, { error: 'missing id' });
+
+    if (role === 'host' && !AUTH_ENABLED) {
+      const left = authLockLeft(req);
+      if (left > 0) return tooMany(res, left);
+      if (!keyOk(String((body && body.key) || ''))) {
+        noteAuthFail(req);
+        return json(res, 401, { error: '开播口令不正确' });
+      }
+      clearAuthFail(req);
+    }
+
+    const user = AUTH_ENABLED ? authUserOf(req) : null;
+    if (role === 'host' && AUTH_ENABLED && !user) return json(res, 401, { error: '请先登录' });
+    const ticket = issueSseTicket(role, id, req.session, user);
+    return json(res, 200, { ok: true, ticket, expiresIn: SSE_TICKET_TTL_MS / 1000 });
   }
 
   if (req.method === 'POST' && route === '/api/signal') {

@@ -62,6 +62,12 @@ function req(method, pathname, body, headers, port) {
 }
 
 /* 建立 SSE 连接，收集事件 */
+/* 口令模式不再允许把 key 拼进 SSE URL：先换成一次性票据 */
+function sseTicket(id, role = 'host', key = KEY, headers, port) {
+  return req('POST', '/api/sse-ticket', { role, id, key }, headers, port)
+    .then((r) => ({ status: r.status, ticket: (r.body && r.body.ticket) || '', body: r.body, headers: r.headers }));
+}
+
 function sse(query, port, cookie) {
   return new Promise((resolve, reject) => {
     const events = [];
@@ -189,7 +195,8 @@ async function testTurn() {
       check('credential 与 HMAC-SHA1 一致', turnEntry.credential === expect);
     }
     check('凭证不进客户端可见的其它字段', !flat.includes(secret));
-    const hostConn = await sse('role=host&id=zero-grace', port);
+    const zgTicket = await sseTicket('zero-grace', 'host', KEY, undefined, port);
+    const hostConn = await sse(`role=host&id=zero-grace&ticket=${zgTicket.ticket}`, port);
     await hostConn.waitFor('welcome');
     await req('POST', '/api/stream', { id: 'zero-grace', live: true }, null, port);
     hostConn.close();
@@ -249,10 +256,24 @@ async function testTurn() {
     const noKey = await sse('role=host&id=h0&name=Luma');
     check('无口令连 host SSE → 401', noKey.status === 401);
 
-    const host = await sse(`role=host&id=host1&name=Luma&key=${KEY}`);
+    const hostTicket = await sseTicket('host1');
+    check('口令换票成功', hostTicket.status === 200 && Boolean(hostTicket.ticket));
+    const host = await sse(`role=host&id=host1&name=Luma&ticket=${hostTicket.ticket}`);
     const welcome = await host.waitFor('welcome');
     check('带口令连 host SSE → welcome', host.status === 200 && !!welcome);
     check('host 也收到 ice 配置', !!(welcome && welcome.data && welcome.data.ice));
+
+    /* 票据一次性：同一张票不能再用第二次 */
+    const replay = await sse(`role=host&id=hostT&name=Luma&ticket=${hostTicket.ticket}`);
+    check('票据用过即废', replay.status === 401, `status=${replay.status}`);
+
+    /* 老写法（口令进 URL）必须被拒，否则口令会留在反代日志里 */
+    const legacyKey = await sse(`role=host&id=hostK&name=Luma&key=${KEY}`);
+    check('URL 里带口令 → 401 ticket-required',
+      legacyKey.status === 401 && String(legacyKey.body || '').includes('ticket-required'),
+      `status=${legacyKey.status}`);
+    const badTicket = await sse('role=host&id=hostB&name=Luma&ticket=not-a-ticket');
+    check('伪造票据 → 401', badTicket.status === 401);
 
     const viewer = await sse('role=viewer&id=v1&name=%E9%98%BF%E6%98%8E');
     const vWelcome = await viewer.waitFor('welcome');
@@ -270,7 +291,8 @@ async function testTurn() {
     check('不同会话冒用真实 host id 聊天 → 403', forgedChat.status === 403);
     const forgedStream = await req('POST', '/api/stream', { id: 'host1', key: KEY, live: true }, { Cookie: outsiderCookie });
     check('不同会话持正确口令冒用 host 操作 → 403', forgedStream.status === 403);
-    const forgedSse = await sse(`role=host&id=host1&key=${KEY}`, PORT, outsiderCookie);
+    const forgedTicket = await sseTicket('host1');
+    const forgedSse = await sse(`role=host&id=host1&ticket=${forgedTicket.ticket}`, PORT, outsiderCookie);
     check('不同会话替换真实 host SSE → 409', forgedSse.status === 409);
     const changedRole = await sse('role=viewer&id=host1');
     check('相同会话改变在线 id 角色 → 409', changedRole.status === 409);
@@ -329,7 +351,8 @@ async function testTurn() {
     check('观众没有收到 stream-ended', !viewer.events.some((e) => e.event === 'stream-ended'));
 
     // 宽限期内回来
-    const host2 = await sse(`role=host&id=host1&name=Luma&key=${KEY}`);
+    const host2Ticket = await sseTicket('host1');
+    const host2 = await sse(`role=host&id=host1&name=Luma&ticket=${host2Ticket.ticket}`);
     await host2.waitFor('welcome');
     await sleep(GRACE + 400);
     const st2 = await req('GET', '/api/state');
@@ -390,8 +413,8 @@ async function testTurn() {
     const lockedGood = await req('POST', '/api/auth', { key: KEY });
     check('锁定期间连正确口令也 429', lockedGood.status === 429);
 
-    const lockedSse = await sse(`role=host&id=hl&name=Luma&key=${KEY}`);
-    check('锁定期间 host SSE 也拒', lockedSse.status === 429);
+    const lockedTicket = await sseTicket('hl');
+    check('锁定期间换票也拒', lockedTicket.status === 429);
 
     await sleep(LOCK_MS + 400);
     for (let i = 1; i <= MAX_FAILS; i += 1) {
@@ -434,7 +457,13 @@ async function iceOrder(env, port, turn, role) {
     if (!await srv.ready()) return { ice, boot: srv.boot() };
     boot = srv.boot();
     const turnQ = turn ? `&turn=${encodeURIComponent(turn)}` : '';
-    const viewer = await sse(`role=${role || 'viewer'}&id=probe&name=probe${turnQ}`, port);
+    /* host 身份要票据（这些子服务都没配口令，票据只是握手凭证） */
+    let ticketQ = '';
+    if ((role || 'viewer') === 'host') {
+      const t = await sseTicket('probe', 'host', '', undefined, port);
+      ticketQ = `&ticket=${t.ticket}`;
+    }
+    const viewer = await sse(`role=${role || 'viewer'}&id=probe&name=probe${turnQ}${ticketQ}`, port);
     const welcome = await viewer.waitFor('welcome');
     ice = welcome && welcome.data && welcome.data.ice;
     viewer.close();
@@ -526,7 +555,8 @@ async function testDynamicHostLines() {
   let v2 = null;
   try {
     if (!await srv.ready()) return check('动态线路测试服务启动', false, srv.boot().slice(-200));
-    host = await sse('role=host&id=dh&name=H', port);
+    const dhTicket = await sseTicket('dh', 'host', KEY, undefined, port);
+    host = await sse(`role=host&id=dh&name=H&ticket=${dhTicket.ticket}`, port);
     await host.waitFor('welcome');
     const live = await req('POST', '/api/stream', { id: 'dh', live: true }, null, port);
     check('动态线路测试：开播成功', live.status === 200 && live.body.live === true);
