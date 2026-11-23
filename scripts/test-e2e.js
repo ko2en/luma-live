@@ -119,17 +119,12 @@ async function connect(wsUrl) {
       tracks: s ? s.getTracks().map(t => t.kind + ':' + t.readyState) : [],
       currentTime: v ? Number(v.currentTime.toFixed(2)) : null,
       idleTitle: (document.querySelector('[data-idle-title]') || {}).textContent,
-      live: (document.querySelector('[data-live-badge]') || {}).textContent,
-      connection: document.querySelector('[data-connection-type]').textContent,
-      connectionTitle: document.querySelector('[data-connection-type]').title,
-      ariaLive: document.querySelector('[data-connection-type]').getAttribute('aria-live'),
-      connectionVisible: document.querySelector('[data-connection-type]').getBoundingClientRect().width > 0
+      live: (document.querySelector('[data-live-badge]') || {}).textContent
     };
   })()`);
 
   await sleep(4000);
   out.hostStats = await host.evaluate(`(() => ({
-    connections: document.querySelector('[data-st-connections]').textContent,
     bitrate: (document.querySelector('[data-st-bitrate]') || {}).textContent,
     sendQuality: (document.querySelector('[data-st-send]') || {}).textContent,
     viewers: (document.querySelector('[data-st-viewers]') || {}).textContent
@@ -143,18 +138,11 @@ async function connect(wsUrl) {
     const s = v && v.srcObject;
     return {
       playing: document.querySelector('[data-player]').classList.contains('is-playing'),
-      connection: document.querySelector('[data-connection-type]').textContent,
       tracks: s ? s.getTracks().filter(t => t.readyState === 'live').length : 0,
       idleTitle: (document.querySelector('[data-idle-title]') || {}).textContent
     };
   })()`);
 
-  await host.evaluate(`document.querySelector('[data-go-live]').click()`);
-  await sleep(1500);
-  out.stopped = {
-    viewer: await viewer.evaluate(`document.querySelector('[data-connection-type]').textContent`),
-    host: await host.evaluate(`document.querySelector('[data-st-connections]').textContent`)
-  };
   out.hostErrors = host.errors;
   out.viewerErrors = viewer.errors;
   console.log(JSON.stringify(out, null, 2));
@@ -167,15 +155,7 @@ async function connect(wsUrl) {
   const ok = out.hostLive.badge.includes('ON AIR')
     && out.viewer.tracks.length > 0
     && out.viewer.playing
-    && out.viewer.connection === 'P2P直连'
-    && out.viewer.connectionTitle.includes('不经过 TURN')
-    && out.viewer.ariaLive === 'polite'
-    && out.viewer.connectionVisible
-    && out.hostStats.connections === 'P2P 1路 / TURN 0路 / 检测中0路'
-    && out.afterReload.connection === 'P2P直连'
     && out.afterReload.playing
-    && out.stopped.viewer === '未连接'
-    && out.stopped.host === 'P2P 0路 / TURN 0路 / 检测中0路'
     && !out.hostErrors.length && !out.viewerErrors.length;
   if (!ok) process.exitCode = 1;
 })();

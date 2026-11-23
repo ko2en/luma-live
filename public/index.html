@@ -4,9 +4,12 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>LUMA · 直播间</title>
-<meta name="description" content="浏览器直连的轻量自建直播间：视频、聊天、零安装。" />
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%237c3aed'/%3E%3Crect x='11' y='11' width='10' height='10' rx='2' fill='%2308080b'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/styles.css?v=15" />
+<meta name="description" content="经 TURN 中继的轻量自建直播间：视频、聊天、零安装。" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23111'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23e8462f'/%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://registry.npmmirror.com" crossorigin>
+<link rel="stylesheet" href="https://registry.npmmirror.com/lxgw-wenkai-webfont/1.7.0/files/lxgwwenkai-regular.css">
+<link rel="stylesheet" href="https://registry.npmmirror.com/lxgw-wenkai-webfont/1.7.0/files/lxgwwenkai-bold.css">
+<link rel="stylesheet" href="/styles.css?v=24" />
 </head>
 <body>
 <div class="ambient"></div>
@@ -33,6 +36,7 @@
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/><path d="m15 12 4 2.5v-9L15 8"/></svg>
       开播控制台
     </a>
+    <span class="auth-slot" data-auth hidden></span>
   </div>
 </header>
 
@@ -55,7 +59,10 @@
 
       <span class="player-badge-corner" data-connection-type="idle" aria-live="polite" title="媒体尚未连接，是否使用 TURN 中继尚未确定。">未连接</span>
 
-      <select class="player-turn-pick" data-turn-pick aria-label="中继线路" hidden></select>
+      <button class="fullscreen-btn" data-fullscreen type="button" aria-label="全屏播放" title="全屏播放">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5"/></svg>
+        <span>全屏</span>
+      </button>
 
       <button class="unmute-btn" data-unmute hidden>
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M16 9a4 4 0 0 1 0 6"/></svg>
@@ -66,10 +73,9 @@
     <div class="meta">
       <h1 data-title>正在连接直播间…</h1>
       <div class="byline">
-        <span class="avatar" data-avatar>L</span>
+        <span class="avatar" data-avatar>–</span>
         <div class="byline-text">
-          <div class="byline-name" data-streamer>Luma</div>
-          <div class="byline-sub" data-bio></div>
+          <div class="byline-name" data-streamer>等待主播</div>
         </div>
         <div class="meta-stats">
           <div class="meta-stat"><span class="k">本场时长</span><span class="v" data-uptime-2>--:--</span></div>
@@ -77,14 +83,15 @@
         </div>
       </div>
 
+      <div class="audience" data-audience hidden>
+        <span class="audience-k">在场</span>
+        <span class="audience-list" data-audience-list></span>
+      </div>
+
       <div class="stage-foot">
         <div class="foot-item">
-          <span class="k">传输协议</span>
-          <span class="v">WebRTC · 低延迟传输</span>
-        </div>
-        <div class="foot-item">
-          <span class="k">端到端延迟</span>
-          <span class="v">通常 200–500 ms</span>
+          <span class="k">线路</span>
+          <span class="v" data-line-label>连接中…</span>
         </div>
         <div class="foot-item foot-share">
           <span class="k">分享</span>
@@ -109,7 +116,7 @@
     </div>
 
     <form class="chat-form" data-chat-form autocomplete="off">
-      <button class="name-chip" data-name type="button" title="点击修改昵称">访客</button>
+      <span class="name-chip name-chip-static" data-name title="当前登录账号">读取中…</span>
       <input data-chat-input maxlength="200" placeholder="说点什么…" />
       <button class="send" type="submit" data-send>发送</button>
     </form>
@@ -124,6 +131,7 @@
 
 <div class="toast" data-toast></div>
 
-<script src="/viewer.js?v=19"></script>
+<script src="/viewer.js?v=30"></script>
+<script src="/auth-ui.js?v=2"></script>
 </body>
 </html>

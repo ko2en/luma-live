@@ -3,17 +3,13 @@
 
   const $ = (sel, root = document) => root.querySelector(sel);
 
-  /* ICE 默认值（纯 STUN 直连）。服务端 welcome 里下发 iceServers 时会被覆盖，
-     配了 TURN 的部署不需要改前端；没配的部署行为与以前完全一致。 */
+  /* ICE 默认值：未收到服务端配置时使用，媒体固定走中继（relay）。
+     服务端 welcome 里下发 iceServers 时会被覆盖，换机房只改环境变量。 */
   const ICE = {
-    iceServers: [
-      { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-      { urls: 'stun:global.stun.twilio.com:3478' }
-    ],
-    iceTransportPolicy: 'all',  /* welcome 收到前先用默认；收到后由服务端决定 */
-    lines: [],   /* 服务端下发的可选线路，用来填下拉 */
-    line: 'p2p',  /* 本次实际生效的线路 */
-    byLine: {}    /* 每条线路的现签 ICE 配置：主播按观众的选择逐路取用 */
+    iceServers: [],
+    iceTransportPolicy: 'relay',
+    lines: [],
+    line: ''
   };
 
   function applyIce(cfg) {
@@ -25,7 +21,6 @@
     /* line / lines 服务端下发：本次生效的线路 + 全部可选线路（主播端只用来标注节点名） */
     ICE.line = !Array.isArray(cfg) && typeof cfg.line === 'string' && cfg.line ? cfg.line : 'p2p';
     ICE.lines = !Array.isArray(cfg) && Array.isArray(cfg.lines) ? cfg.lines : [];
-    if (!Array.isArray(cfg) && cfg.byLine && typeof cfg.byLine === 'object') ICE.byLine = cfg.byLine;
   }
 
   /* 中继 IP → 节点显示名 */
@@ -33,6 +28,12 @@
     if (!addr) return '';
     const hit = (ICE.lines || []).find((l) => l && l.host === addr);
     return hit ? (hit.title || hit.id) : addr;
+  }
+
+  /* 线路名由服务端下发，换机房不用改前端 */
+  function relayTitle() {
+    const line = (ICE.lines || [])[0];
+    return (line && (line.title || line.id)) || '中继';
   }
 
   const el = {
@@ -55,11 +56,11 @@
     rec: $('[data-rec]'),
     title: $('[data-title-input]'),
     goLive: $('[data-go-live]'),
-    hint: $('[data-hint]'),
     badge: $('[data-live-badge]'),
     viewers: $('[data-viewers]'),
     stStatus: $('[data-st-status]'),
     stViewers: $('[data-st-viewers]'),
+    stAudience: $('[data-st-audience]'),
     stTime: $('[data-st-time]'),
     stRes: $('[data-st-res]'),
     stSend: $('[data-st-send]'),
@@ -94,7 +95,7 @@
 
   const hostId = uuid();
   const peers = new Map();
-  const viewerLines = new Map();  /* viewerId → 该观众当前选的线路（主播逐路跟随） */
+  const viewerGenerations = new Map();
   let localStream = null;
   let camStream = null;
   let screenStream = null;
@@ -253,8 +254,8 @@
 
   function paintMediaState() {
     const micOk = micOn && !!micStream;
-    el.dotCam.style.background = camOn ? 'var(--ok)' : '#6b6a7d';
-    el.dotMic.style.background = micOk ? 'var(--ok)' : (micIssue ? '#ff5b63' : '#6b6a7d');
+    el.dotCam.style.background = camOn ? 'var(--ok)' : '#b8b8b2';
+    el.dotMic.style.background = micOk ? 'var(--ok)' : (micIssue ? '#e8462f' : '#b8b8b2');
     el.btnCam.classList.toggle('is-off', !camOn);
     el.btnMic.classList.toggle('is-off', !micOk);
     el.wrap.classList.toggle('is-mirrored', !usingScreen);
@@ -834,9 +835,6 @@
     el.goLive.disabled = false;
     el.stStatus.textContent = live ? '直播中' : '未开播';
     el.stStatus.className = `v ${live ? 'ok' : ''}`;
-    el.hint.textContent = live
-      ? '观众端是点对点直连：每多一位观众，你的上行带宽就多占用一份。人多时请适当降低分辨率。'
-      : '先说清楚：这是点对点直连，没有中心服务器转码。主播上行带宽 = 每位观众一份，适合几十人以内的自留地直播。';
     if (evicted) {
       el.goLive.classList.remove('is-live');
       el.goLive.disabled = true;
@@ -942,33 +940,34 @@
     }, 400);
   });
 
-  /* ================= 点对点连接 ================= */
+  /* ================= 观众连接 ================= */
 
   function postSignal(to, data) {
     post('/api/signal', { from: hostId, to, data }).catch(() => {});
   }
 
   function paintConnections() {
-    const counts = { direct: 0, relay: 0 };
+    const counts = { relay: 0 };
     const relayNodes = new Map();   // 中继线路名 → 路数
     if (live) for (const pc of peers.values()) {
       /* 只统计已经连上的：连不上的不计入，避免出现「检测中」这种悬着的状态 */
       if (pc.connectionState !== 'connected') continue;
-      const type = pc.__connectionType === 'relay' ? 'relay' : 'direct';
+      /* TURN 线路创建时强制 relay，统计尚未回报前也不能先误计作直连。 */
+      const type = 'relay';
       counts[type] += 1;
       if (type === 'relay' && pc.__relayNode) {
         relayNodes.set(pc.__relayNode, (relayNodes.get(pc.__relayNode) || 0) + 1);
       }
     }
-    let relayPart = `TURN ${counts.relay}路`;
-    if (relayNodes.size) {
-      relayPart += `（${[...relayNodes].map(([k, v]) => `${k} ${v}`).join(' / ')}）`;
-    }
-    const text = `P2P ${counts.direct}路 / ${relayPart}`;
+    const nodeText = relayNodes.size
+      ? `（${[...relayNodes].map(([k, v]) => `${k} ${v}`).join(' / ')}）`
+      : '';
+    const text = `${relayTitle()} TURN ${counts.relay}路${nodeText}`;
     if (el.stConnections.textContent !== text) el.stConnections.textContent = text;
   }
 
   function closePeer(viewerId) {
+    viewerGenerations.set(viewerId, (viewerGenerations.get(viewerId) || 0) + 1);
     const pc = peers.get(viewerId);
     if (!pc) return;
     try {
@@ -982,7 +981,6 @@
 
   function closeAllPeers() {
     for (const id of Array.from(peers.keys())) closePeer(id);
-    viewerLines.clear();
     lastBytes = null;
     el.stBitrate.textContent = '—';
   }
@@ -1014,9 +1012,53 @@
     paintLiveState();
   }
 
+  /* 头像节点：有头像用 img，否则首字。 */
+  function avatarNode(url, name, className) {
+    const node = document.createElement('span');
+    node.className = className;
+    const initial = document.createElement('span');
+    initial.textContent = (name || '?').slice(0, 1).toUpperCase();
+    node.appendChild(initial);
+    if (/^\/api\/avatar\/[a-f0-9]{32}\.(png|jpg|webp)$/.test(url || '')) {
+      const img = document.createElement('img');
+      img.className = 'avatar-img';
+      img.alt = '';
+      img.src = url;
+      img.addEventListener('error', () => { img.remove(); });
+      node.appendChild(img);
+    }
+    return node;
+  }
+
+  /* 在场观众名单：只列观众（主播自己不重复显示），服务端按登录账号去重。 */
+  function paintAudience(list) {
+    if (!el.stAudience) return;
+    if (!Array.isArray(list)) return;
+    const people = list.filter((p) => p && p.role !== 'host' && p.name)
+      .map((p) => ({ name: String(p.name).slice(0, 24), avatar: p.avatar }));
+    if (!people.length) {
+      el.stAudience.textContent = '—';
+      el.stAudience.title = '';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    people.forEach((p, i) => {
+      if (i > 0) frag.appendChild(document.createTextNode('、'));
+      const tag = document.createElement('span');
+      tag.className = 'audience-name';
+      tag.appendChild(avatarNode(p.avatar, p.name, 'audience-avatar'));
+      const label = document.createElement('span');
+      label.textContent = p.name;
+      tag.appendChild(label);
+      frag.appendChild(tag);
+    });
+    el.stAudience.replaceChildren(frag);
+    el.stAudience.title = people.map((p) => p.name).join('、');
+  }
+
   /* 别处的开播台凭同一个口令上线了：这边立刻停播，且不再自动重连。
      否则两边会互相顶替，每个 offer 都被打断，观众永远黑屏。 */
-  function handleHostTaken() {
+  function stopForTaken(message) {
     if (evicted) return;
     evicted = true;
     clearTimeout(reconnectTimer);
@@ -1029,7 +1071,16 @@
     closeAllPeers();
     releaseCapture();
     setEvicted(true);
-    toast('已在别处开播，这个标签页已停止推流');
+    if (message) toast(message);
+  }
+
+  function handleHostTaken() {
+    stopForTaken('已在别处开播，这个标签页已停止推流');
+  }
+
+  /* 同账号在别处看/播：立即停推流、断连、不再自动重连，避免两边互踢。 */
+  function handleAccountTaken() {
+    stopForTaken('账号已在别处使用，这个标签页已停止推流');
   }
 
   /* 每个观众一条独立 RTCPeerConnection，天然可以单独设档。
@@ -1174,15 +1225,11 @@
     return; /* 固定发送档位：不再根据视频统计调整分辨率 */
   }
 
-  /* 主播不再写死一条线路：每个观众用他自己选的那份 ICE 配置建 peer。
-     这样 p2p 观众不会撞上主播的 relay-only 候选，上海/香港也能各走各的。 */
-  function iceForViewer(viewerId) {
-    const line = viewerLines.get(viewerId) || ICE.line || 'p2p';
-    const cfg = ICE.byLine && ICE.byLine[line];
+  /* 所有观众共用同一份中继 ICE 配置：只走 TURN，不允许直连。 */
+  function iceForViewer() {
     return {
-      iceServers: cfg && Array.isArray(cfg.iceServers) && cfg.iceServers.length
-        ? cfg.iceServers : ICE.iceServers,
-      iceTransportPolicy: cfg && cfg.iceTransportPolicy ? cfg.iceTransportPolicy : ICE.iceTransportPolicy
+      iceServers: ICE.iceServers,
+      iceTransportPolicy: 'relay'
     };
   }
 
@@ -1190,7 +1237,15 @@
     if (!localStream || !live) return;
     closePeer(viewerId);
 
-    const pc = new RTCPeerConnection(iceForViewer(viewerId));
+    const iceConfig = iceForViewer();
+    /* 每次重建都带世代号：异步 tunePeer/createOffer 期间若观众再次切线，
+       旧 peer 不得在新线路之后继续发 offer。 */
+    const generation = (viewerGenerations.get(viewerId) || 0) + 1;
+    viewerGenerations.set(viewerId, generation);
+    const isCurrent = () => viewerGenerations.get(viewerId) === generation
+      && peers.get(viewerId) === pc;
+    const pc = new RTCPeerConnection(iceConfig);
+    pc.__icePolicy = iceConfig.iceTransportPolicy;
     pc.__tier = 'high';
     pc.__relay = false;
     pc.__relayNode = '';
@@ -1205,6 +1260,7 @@
 
     // 采集与发送均以 30fps 为目标；带宽/编码压力下优先牺牲本路分辨率。
     await tunePeer(pc);
+    if (!isCurrent()) return;
 
     pc.onicecandidate = (e) => {
       if (e.candidate) postSignal(viewerId, { candidate: e.candidate });
@@ -1226,10 +1282,12 @@
 
     try {
       const offer = await pc.createOffer();
+      if (!isCurrent()) return;
       await pc.setLocalDescription(offer);
+      if (!isCurrent()) return;
       postSignal(viewerId, { sdp: pc.localDescription });
     } catch (err) {
-      closePeer(viewerId);
+      if (isCurrent()) closePeer(viewerId);
     }
   }
 
@@ -1274,6 +1332,7 @@
 
     /* 服务端切断这条连接之前会先发这一帧：说明不是网络抖动，是被接管了 */
     es.addEventListener('host-taken', () => handleHostTaken());
+    es.addEventListener('account-taken', () => handleAccountTaken());
 
     es.addEventListener('welcome', (e) => {
       const data = JSON.parse(e.data);
@@ -1291,6 +1350,7 @@
       }
       el.viewers.textContent = data.viewers || 0;
       el.stViewers.textContent = data.viewers || 0;
+      paintAudience(data.audience);
     });
 
     es.addEventListener('state', (e) => {
@@ -1299,6 +1359,7 @@
         el.viewers.textContent = data.viewers;
         el.stViewers.textContent = data.viewers;
       }
+      paintAudience(data.audience);
       if (data.startedAt) startedAt = data.startedAt;
       if (typeof data.live === 'boolean' && data.live !== live) {
         live = data.live;
@@ -1310,39 +1371,24 @@
     es.addEventListener('go-live', (e) => {
       let data = {};
       try { data = JSON.parse(e.data); } catch (err) { /* noop */ }
-      const viewers = Array.isArray(data.viewers)
-        ? data.viewers
-        : Array.from(peers.keys()).map((id) => ({ id, line: viewerLines.get(id) || ICE.line }));
+      const viewers = Array.isArray(data.viewers) ? data.viewers : Array.from(peers.keys()).map((id) => ({ id }));
       viewers.forEach((v) => {
         const vid = typeof v === 'string' ? v : v && v.id;
         if (!vid) return;
-        if (v && v.line) viewerLines.set(vid, v.line);
         connectViewer(vid);
       });
     });
 
     es.addEventListener('viewer-joined', (e) => {
-      const { id, line } = JSON.parse(e.data) || {};
-      if (id) {
-        if (line) viewerLines.set(id, line);
-        connectViewer(id);
-      }
+      const { id } = JSON.parse(e.data) || {};
+      if (id) connectViewer(id);
     });
 
     es.addEventListener('viewer-left', (e) => {
       const { id } = JSON.parse(e.data) || {};
       if (id) {
-        viewerLines.delete(id);
         closePeer(id);
       }
-    });
-
-    es.addEventListener('viewer-line', (e) => {
-      const { id, line } = JSON.parse(e.data) || {};
-      if (!id || !line) return;
-      viewerLines.set(id, line);
-      /* ICE 只在 new RTCPeerConnection 时读取，换线路必须重建这一路 */
-      if (peers.has(id)) connectViewer(id);
     });
 
     es.addEventListener('stream-ended', () => {

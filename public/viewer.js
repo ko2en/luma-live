@@ -4,16 +4,13 @@
   /* ================= 基础 ================= */
 
   const $ = (sel, root = document) => root.querySelector(sel);
-  /* ICE 默认值（纯 STUN 直连）。服务端 welcome 里下发 iceServers 时会被覆盖，
-     所以配了 TURN 的部署不用改前端；没配的部署行为与以前完全一致。 */
+  /* ICE 默认值：未收到服务端配置时使用，媒体固定走中继（relay）。
+     服务端 welcome 里下发 iceServers 时会被覆盖，换机房只改环境变量。 */
   const ICE = {
-    iceServers: [
-      { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-      { urls: 'stun:global.stun.twilio.com:3478' }
-    ],
-    iceTransportPolicy: 'all',  /* welcome 收到前先用默认；收到后由服务端决定 */
-    lines: [],   /* 服务端下发的可选线路，用来填下拉 */
-    line: 'p2p'  /* 本次实际生效的线路 */
+    iceServers: [],
+    iceTransportPolicy: 'relay',
+    lines: [],
+    line: ''
   };
 
   function applyIce(cfg) {
@@ -21,12 +18,9 @@
     const list = Array.isArray(cfg) ? cfg : cfg.iceServers;
     if (!Array.isArray(list) || !list.length) return;
     ICE.iceServers = list;
-    /* 选了 TURN 线路就只收集 relay 候选，浏览器不会再偷偷走直连；
-       这样「选上海」才真的走上海中继，状态标签也不会显示成 P2P。 */
-    ICE.iceTransportPolicy = !Array.isArray(cfg) && cfg.iceTransportPolicy === 'relay' ? 'relay' : 'all';
-    /* line / lines 服务端下发：本次生效的线路 + 全部可选线路 */
-    ICE.line = !Array.isArray(cfg) && typeof cfg.line === 'string' && cfg.line ? cfg.line : 'p2p';
+    ICE.iceTransportPolicy = 'relay';
     ICE.lines = !Array.isArray(cfg) && Array.isArray(cfg.lines) ? cfg.lines : [];
+    ICE.line = !Array.isArray(cfg) && cfg.line ? cfg.line : (ICE.lines[0] && ICE.lines[0].id) || '';
   }
 
   const el = {
@@ -40,7 +34,6 @@
     title: $('[data-title]'),
     titleEcho: $('[data-title-echo]'),
     streamer: $('[data-streamer]'),
-    bio: $('[data-bio]'),
     avatar: $('[data-avatar]'),
     viewers: $('[data-viewers]'),
     viewers2: $('[data-viewers-2]'),
@@ -60,7 +53,10 @@
     chatClose: $('[data-chat-close]'),
     fabBadge: $('[data-fab-badge]'),
     shareBtn: $('[data-share]'),
-    turnPick: $('[data-turn-pick]'),
+    fullscreen: $('[data-fullscreen]'),
+    lineLabel: $('[data-line-label]'),
+    audience: $('[data-audience]'),
+    audienceList: $('[data-audience-list]'),
     toast: $('[data-toast]')
   };
 
@@ -82,9 +78,9 @@
       : `v-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
 
   const clientId = uuid();
-  let nickname =
-    (localStorage.getItem('luma:name') || '').trim() ||
-    `访客·${1000 + Math.floor(Math.random() * 9000)}`;
+  /* 聊天名 = 登录账号，由服务端从 /api/me 认定，前端不提供自定义昵称。
+     未启用登录的旧部署拿不到 user，退回一个占位名。 */
+  let nickname = '用户';
 
   const state = {
     live: false,
@@ -136,6 +132,72 @@
     if (!isLive) el.uptime2.textContent = '--:--';
   }
 
+  /* 圆形头像节点：有图片用 img（textContent 兜底），否则显示名字首字。 */
+  function avatarNode(url, name, className) {
+    const node = document.createElement('span');
+    node.className = className;
+    const initial = document.createElement('span');
+    initial.textContent = (name || '?').slice(0, 1).toUpperCase();
+    node.appendChild(initial);
+    if (/^\/api\/avatar\/[a-f0-9]{32}\.(png|jpg|webp)$/.test(url || '')) {
+      const img = document.createElement('img');
+      img.className = 'avatar-img';
+      img.alt = '';
+      img.src = url;
+      img.addEventListener('error', () => { img.remove(); });
+      node.appendChild(img);
+    }
+    return node;
+  }
+
+  /* 把已有容器（主播头像）更新为图片或首字，保留原元素不重建。 */
+  function setAvatar(container, url, name) {
+    if (!container) return;
+    let initial = container.querySelector('.avatar-initial');
+    if (!initial) {
+      initial = document.createElement('span');
+      initial.className = 'avatar-initial';
+      container.replaceChildren(initial);
+    }
+    initial.textContent = (name || '?').slice(0, 1).toUpperCase();
+    const valid = /^\/api\/avatar\/[a-f0-9]{32}\.(png|jpg|webp)$/.test(url || '');
+    let img = container.querySelector('.avatar-img');
+    if (valid) {
+      if (!img) {
+        img = document.createElement('img');
+        img.className = 'avatar-img';
+        img.alt = '';
+        img.addEventListener('error', () => { img.remove(); });
+        container.appendChild(img);
+      }
+      if (img.getAttribute('src') !== url) img.src = url;
+    } else if (img) {
+      img.remove();
+    }
+  }
+
+  /* 在场名单：服务端下发的账号名，主播标「主播」，其余为观众。
+     用 DOM 文本而非 innerHTML，杜绝名字里的标签注入。 */
+  function paintAudience(list) {
+    if (!el.audience || !el.audienceList || !Array.isArray(list)) return;
+    if (!list.length) { el.audience.hidden = true; return; }
+    el.audience.hidden = false;
+    const frag = document.createDocumentFragment();
+    list.forEach((person, i) => {
+      const name = String((person && person.name) || '').slice(0, 24);
+      if (!name) return;
+      if (i > 0) frag.appendChild(document.createTextNode('、'));
+      const tag = document.createElement('span');
+      tag.className = 'audience-name' + (person.role === 'host' ? ' is-host' : '');
+      tag.appendChild(avatarNode(person.avatar, name, 'audience-avatar'));
+      const label = document.createElement('span');
+      label.textContent = person.role === 'host' ? `${name} · 主播` : name;
+      tag.appendChild(label);
+      frag.appendChild(tag);
+    });
+    el.audienceList.replaceChildren(frag);
+  }
+
   function applyState(s) {
     if (typeof s.title === 'string' && s.title) {
       el.title.textContent = s.title;
@@ -143,13 +205,20 @@
     }
     if (s.streamer) {
       el.streamer.textContent = s.streamer;
-      el.avatar.textContent = s.streamer.slice(0, 1);
+      setAvatar(el.avatar, s.streamerAvatar, s.streamer);
     }
-    if (typeof s.bio === 'string') el.bio.textContent = s.bio;
+    /* 线路栏：显示服务端下发的当前中继节点名（数据驱动，未写死城市）。 */
+    if (s.line && el.lineLabel) {
+      const title = s.line.title || s.line.id || '';
+      const label = title ? `TURN · ${title}` : '中继';
+      if (el.lineLabel.textContent !== label) el.lineLabel.textContent = label;
+      el.lineLabel.title = s.line.host ? `媒体经 ${title}（${s.line.host}）中继` : '媒体经中继服务器转发';
+    }
     if (typeof s.viewers === 'number') {
       el.viewers.textContent = s.viewers;
       el.viewers2.textContent = s.viewers;
     }
+    paintAudience(s.audience);
     if (s.startedAt) state.startedAt = s.startedAt;
     if (typeof s.hostOnline === 'boolean' && !s.hostOnline) state.hostId = null;
     if (s.muted) {
@@ -176,12 +245,12 @@
   }
 
   function paintConnection(type, nodeLabel) {
-    /* 连上了却没有 relay 候选，就是直连 —— 不再显示「检测中」这种中间态 */
-    if (type === 'unknown') type = 'direct';
+    /* ICE 统计确认候选对之前不猜测直连/中继，避免刚 connected 的瞬间误报。 */
+    if (type === 'unknown') type = 'connecting';
     const labels = {
       idle: ['未连接', '媒体尚未连接。'],
       connecting: ['连接中', '正在建立媒体连接。'],
-      direct: ['P2P直连', '媒体在双方之间直接传输，不经过 TURN 中继。'],
+      direct: ['直连', '媒体在双方之间直接传输（本站固定走 TURN 中继，正常情况下不会出现）。'],
       relay: ['TURN中继', '媒体经过 TURN 服务器中继，任一端使用中继即计为 TURN。'],
       reconnecting: ['断开重连中', '媒体连接已断开，正在恢复。']
     };
@@ -242,17 +311,15 @@
     const row = document.createElement('div');
     row.className = 'msg';
 
-    const dot = document.createElement('div');
-    dot.className = 'msg-dot';
-    dot.style.background = msg.color || '#a78bfa';
-    dot.textContent = (msg.name || '?').slice(0, 1).toUpperCase();
+    const dot = avatarNode(msg.avatar, msg.name, 'msg-dot');
+    dot.style.background = msg.color || '#e8462f';
 
     const body = document.createElement('div');
     body.className = 'msg-body';
 
     const name = document.createElement('div');
     name.className = 'msg-name';
-    name.style.color = msg.color || '#a78bfa';
+    name.style.color = msg.color || '#e8462f';
     name.textContent = msg.name || '访客';
     if (msg.role === 'host') {
       const tag = document.createElement('span');
@@ -307,56 +374,10 @@
     }
   });
 
-  /* 昵称编辑 */
+  /* 聊天名直接显示登录账号，只读，不可自定义 */
   function paintNameChip() {
-    el.nameChip.textContent = nickname;
-    el.nameChip.title = '点击修改昵称';
+    if (el.nameChip) el.nameChip.textContent = nickname;
   }
-
-  function makeNameChip() {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'name-chip';
-    btn.title = '点击修改昵称';
-    btn.addEventListener('click', editName);
-    return btn;
-  }
-
-  function editName() {
-    const input = document.createElement('input');
-    input.className = 'name-chip';
-    input.value = nickname;
-    input.maxLength = 20;
-    el.nameChip.replaceWith(input);
-    input.focus();
-    input.select();
-
-    let done = false;
-    const finish = (save) => {
-      if (done) return;
-      done = true;
-      if (save) {
-        const next = input.value.trim().slice(0, 20);
-        if (next) {
-          nickname = next;
-          localStorage.setItem('luma:name', nickname);
-        }
-      }
-      const btn = makeNameChip();
-      btn.textContent = nickname;
-      input.replaceWith(btn);
-      el.nameChip = btn;
-      el.chatInput.focus();
-    };
-
-    input.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
-      if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
-    });
-    input.addEventListener('blur', () => finish(true));
-  }
-
-  el.nameChip.addEventListener('click', editName);
 
   /* ================= 移动端聊天面板 ================= */
 
@@ -415,12 +436,12 @@
     }).catch(() => {});
   }
 
-  /* 打洞失败时说人话，别让人盯着「正在接入画面…」等到放弃 */
+  /* 连不上时说人话，别让人盯着「正在接入画面…」等到放弃 */
   function showConnectProblem() {
     el.player.classList.remove('is-playing');
     el.idleTitle.textContent = '连不上主播的画面';
     el.idleSub.textContent =
-      '你和主播之间没能建立直连。公司网络、校园网、部分手机热点会在中间做地址转换，导致 P2P 打洞失败。换一个网络（比如手机热点）重新打开本页通常就好了；如果一直不行，需要主播那边部署 TURN 中继。';
+      '媒体连接没有建立起来。画面全部经本站 TURN 服务器中转，通常是中继线路暂时不可用或主播刚好重连。稍等十几秒刷新本页一般就能恢复；一直不行就找主播确认开播状态。';
   }
 
   async function probeIce(peer) {
@@ -441,8 +462,8 @@
     failStreak += 1;
     const reachable = await probeIce(peer).catch(() => null);
 
-    /* 线路由观众明确选择，失败不能自动重试/换候选；否则主播会反复重建
-       peer，表现成 P2P/上海来回跳。失败后停在当前线路，等观众手动切换。 */
+    /* 只有一条中继线路，失败也不自动重试：反复重建会让主播端
+       peer 抖动，画面看上去就像在两条线路之间来回跳。 */
     hardFail = true;
     clearTimeout(restartTimer);
     paintConnection('idle');
@@ -543,82 +564,13 @@
     el.unmute.hidden = true;
   });
 
-  /* ================= 中继线路 ================= */
+  /* 固定中继 TURN，不再提供线路选择或切换入口。 */
+  let turnLine = '';
 
-  /* 服务端下发可选线路（P2P / 各 TURN 入口），这里只负责选哪一条：
-     选择记在本机 localStorage，重连时以 turn=<线路 id> 告诉服务端。
-     选 P2P 就不给任何 TURN，打洞不通就一直停在那儿，由人自己换线。 */
-  const TURN_KEY = 'luma.turn';
-  let turnLine = readTurnPref();
-
-  function readTurnPref() {
-    try {
-      return localStorage.getItem(TURN_KEY) || '';
-    } catch (err) {
-      return '';
-    }
-  }
-
-  function writeTurnPref(v) {
-    try {
-      /* p2p 也要存：不存的话刷新/重连时 pref 为空就会退回服务器默认线路（上海），
-         看起来就是「选了 P2P 又自动跳回上海」。 */
-      if (!v) localStorage.removeItem(TURN_KEY);
-      else localStorage.setItem(TURN_KEY, v);
-    } catch (err) { /* 隐私模式写不进去，当次有效即可 */ }
-  }
-
-  function paintTurnPick() {
-    if (!el.turnPick) return;
-    const lines = ICE.lines || [];
-    /* 只有 P2P 一条（没配 TURN 的部署）就不显示 */
-    if (lines.length < 2) {
-      el.turnPick.hidden = true;
-      return;
-    }
-    el.turnPick.hidden = false;
-
-    const sig = lines.map((l) => `${l.id}:${l.title}`).join(',');
-    if (el.turnPick.dataset.built !== sig) {
-      el.turnPick.textContent = '';
-      lines.forEach((l) => {
-        const opt = document.createElement('option');
-        opt.value = l.id;
-        opt.textContent = l.title || l.id;
-        el.turnPick.appendChild(opt);
-      });
-      el.turnPick.dataset.built = sig;
-    }
-
-    const want = ICE.line || 'p2p';
-    if (el.turnPick.value !== want) el.turnPick.value = want;
-    el.turnPick.dataset.line = want;
-    el.turnPick.title = `当前线路：${(lines.find((l) => l.id === want) || {}).title || want}`;
-  }
-
-  /* 线路只能由观众选择，服务端 welcome 不能把它改成另一条：
-     只有首次访问没有选择时，才接受服务器默认线路。 */
   function syncTurnLine(ice) {
-    if (!ice) return;
-    const actual = ice.line || 'p2p';
-    const chosen = readTurnPref();
-    if (!chosen) {
-      turnLine = actual;
-      writeTurnPref(actual);
-    } else {
-      turnLine = chosen;
-    }
-  }
-
-  function switchLine(id) {
-    turnLine = id;
-    writeTurnPref(id);
-    /* 立刻把下拉切到新值，别等服务端 welcome 回来（那要一两秒，看起来像没生效） */
-    ICE.line = id;
-    ICE.iceTransportPolicy = id === 'p2p' ? 'all' : 'relay';
-    paintTurnPick();
-    /* 换线路必须重建：ICE 配置只在新建 RTCPeerConnection 时生效 */
-    reconnectIce();
+    if (ice && ice.line) turnLine = ice.line;
+    ICE.line = turnLine;
+    ICE.iceTransportPolicy = 'relay';
   }
 
   function reconnectIce() {
@@ -636,10 +588,6 @@
     connect();
   }
 
-  if (el.turnPick) {
-    el.turnPick.addEventListener('change', () => switchLine(el.turnPick.value));
-  }
-
   /* ================= 事件流 ================= */
 
   let es = null;
@@ -648,9 +596,8 @@
 
   function connect() {
     const myGen = esGen;
-    const turnQ = turnLine ? `&turn=${encodeURIComponent(turnLine)}` : '';
     es = new EventSource(
-      `/api/events?role=viewer&id=${encodeURIComponent(clientId)}&name=${encodeURIComponent(nickname)}${turnQ}`
+      `/api/events?role=viewer&id=${encodeURIComponent(clientId)}&name=${encodeURIComponent(nickname)}`
     );
 
     es.addEventListener('welcome', (e) => {
@@ -658,7 +605,6 @@
       const data = JSON.parse(e.data);
       applyIce(data.ice);
       syncTurnLine(data.ice);
-      paintTurnPick();
       applyState(data);
       el.chatList.querySelectorAll('.msg, .msg-notice').forEach((n) => n.remove());
       seen.clear();
@@ -692,6 +638,16 @@
       offline('直播已结束', '主播结束了本场直播，页面会自动等待下一场。');
     });
 
+    /* 同一账号在别处观看/开播：本页立刻停看、断流，且不再自动重连，
+       否则两个页面会反复互踢。 */
+    es.addEventListener('account-taken', () => {
+      hardFail = true;
+      try { es.close(); } catch (err) { /* noop */ }
+      setLive(false);
+      offline('账号已在别处使用', '这个账号正在别处观看或开播，本页面已停止播放。刷新页面可重新接管。');
+      toast('账号已在别处使用，本页面已停止');
+    });
+
     es.addEventListener('signal', async (e) => {
       const { from, data } = JSON.parse(e.data) || {};
       if (!data) return;
@@ -709,12 +665,14 @@
     });
 
     es.onerror = () => {
-      if (myGen !== esGen) return;  /* 已被主动重建，别再开一条重复 SSE */
-      // EventSource 会自动重连，这里只做提示
-      if (es.readyState === EventSource.CLOSED) {
-        toast('连接已断开，正在重试…');
-        setTimeout(() => { if (myGen === esGen) connect(); }, 2500);
-      }
+      if (myGen !== esGen) return;  /* 已被主动重建，旧 SSE 不得影响新线路 */
+      /* 不让 EventSource 自动重连：重连可能带着旧的 turn 参数回来，
+         把连接拉回已经不存在的线路。 */
+      try { es.close(); } catch (err) { /* noop */ }
+      clearTimeout(restartTimer);
+      hardFail = true;
+      paintConnection('idle');
+      toast('当前线路连接已断开，请手动选择线路');
     };
   }
 
@@ -751,7 +709,7 @@
     if (types.includes('relay')) connectionType = 'relay';
     else if (types.every((type) => ['host', 'srflx', 'prflx'].includes(type))) connectionType = 'direct';
     /* 选了 TURN 线路但 stats 读不到候选类型（部分浏览器 remotecandidate 不暴露）：
-       既然是强制中继配置，按中继算，不要误报成 P2P。 */
+       既然是强制中继配置，按中继算，不要误报成直连。 */
     if (connectionType === 'unknown' && ICE.iceTransportPolicy === 'relay') connectionType = 'relay';
     /* 中继候选的 address 就是 TURN 给的那段地址，等于节点本身的公网 IP；
        带回去让主播端能标出「这一路走的是哪条中继」 */
@@ -839,7 +797,7 @@
         /* relay=true 表示这一路在走 TURN 中继，主播端会据此压低码率省服务器带宽 */
         relay: connectionType === 'relay',
         connectionType,
-        /* 走中继时带上节点地址，主播端据此显示「上海 / 香港」 */
+        /* 走中继时带上节点地址，主播端据此显示节点名 */
         relayAddr: connectionType === 'relay' ? relayAddr : ''
       }
     });
@@ -848,6 +806,26 @@
   setInterval(sampleLink, 3000);
 
   /* ================= 分享 ================= */
+
+  function paintFullscreen() {
+    if (!el.fullscreen) return;
+    const active = document.fullscreenElement === el.player;
+    el.fullscreen.classList.toggle('is-active', active);
+    el.fullscreen.setAttribute('aria-label', active ? '退出全屏' : '全屏播放');
+    el.fullscreen.title = active ? '退出全屏' : '全屏播放';
+  }
+
+  if (el.fullscreen) el.fullscreen.addEventListener('click', async () => {
+    try {
+      if (document.fullscreenElement === el.player) await document.exitFullscreen();
+      else if (el.player.requestFullscreen) await el.player.requestFullscreen();
+      else if (el.video.webkitEnterFullscreen) el.video.webkitEnterFullscreen();
+    } catch (err) {
+      /* 浏览器拒绝全屏时保持普通播放，不影响直播 */
+    }
+    paintFullscreen();
+  });
+  document.addEventListener('fullscreenchange', paintFullscreen);
 
   if (el.shareBtn) el.shareBtn.addEventListener('click', async () => {
     const url = location.origin + '/' + location.search;
@@ -872,5 +850,17 @@
 
   paintNameChip();
   chatIcon();
-  connect();
+
+  /* 先从登录态拿账号名（服务端也会用 cookie 覆盖，这里只为了前端显示一致），
+     无论成功与否最终都会连上直播间，不因账号接口异常而卡住观看。 */
+  fetch('/api/me', { credentials: 'same-origin' })
+    .then((r) => r.json())
+    .then((me) => {
+      if (me && me.user) nickname = String(me.user).slice(0, 24);
+    })
+    .catch(() => { /* 未启用登录或网络抖动：沿用占位名 */ })
+    .finally(() => {
+      paintNameChip();
+      connect();
+    });
 })();

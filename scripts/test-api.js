@@ -174,7 +174,7 @@ async function testTurn() {
     const flat = JSON.stringify(ice || {});
     check('下发 UDP 通道', flat.includes('turn:turn.example.com:3478?transport=udp'));
     check('下发 TCP 通道', flat.includes('turn:turn.example.com:3478?transport=tcp'));
-    check('TURN_HOST 兼作 STUN', flat.includes('stun:turn.example.com:3478'));
+    check('TURN_HOST 不再额外作为 STUN', !flat.includes('stun:turn.example.com:3478'));
 
     const turnEntry = (ice && ice.iceServers || []).find((s) => String(s.urls).includes('turn:'));
     check('TURN 带凭证', !!(turnEntry && turnEntry.username && turnEntry.credential));
@@ -242,7 +242,7 @@ async function testTurn() {
     check('welcome 里带 ice 配置', !!(pIce && Array.isArray(pIce.iceServers)));
     const pFlat = JSON.stringify(pIce || {});
     check('未配 TURN 时只有默认 STUN', !pFlat.includes('"turn:') && !pFlat.includes('"turns:'));
-    check('默认 STUN 仍在', pFlat.includes('stun.l.google.com:19302'));
+    check('默认 STUN 已移除（固定 TURN）', !pFlat.includes('stun.l.google.com:19302'));
     probe.close();
 
     // ---- 3. host 身份 ----
@@ -463,38 +463,24 @@ function lineIds(ice) {
 }
 
 async function testLines() {
-  const lines = [
-    'sh|203.0.113.20|23478|sh-secret|上海',
-    'hk|hk.example.com|3478|main-secret|香港'
-  ].join(',');
+  const lines = 'sh|203.0.113.20|23478|sh-secret|上海';
   const env = { TURN_LINES: lines, TURN_DEFAULT: 'sh' };
 
   /* 1. 默认线路 */
   const a = await iceOrder(env, PORT + 11);
   check('默认线路取 TURN_DEFAULT', !!(a.ice && a.ice.line === 'sh'), String(a.ice && a.ice.line));
   check('默认只下发这一条 TURN', turnHosts(a.ice).join(',') === '203.0.113.20', turnHosts(a.ice).join(','));
-  check('线路清单 = P2P + 两条', lineIds(a.ice).join(',') === 'p2p,sh,hk', lineIds(a.ice).join(','));
-  check('P2P 排在最前', !!(a.ice && a.ice.lines[0] && a.ice.lines[0].id === 'p2p'));
+  check('线路清单固定上海', lineIds(a.ice).join(',') === 'sh', lineIds(a.ice).join(','));
   check('线路带标题与 host（供前端标注）',
     JSON.stringify(a.ice.lines).includes('上海') && JSON.stringify(a.ice.lines).includes('203.0.113.20'));
   check('启动日志列出线路', (a.boot || '').includes('TURN 线路') && (a.boot || '').includes('上海'), (a.boot || '').slice(-260));
 
-  /* 2. 手动切香港 */
+  /* 2. 旧版客户端即使携带线路参数，也始终固定上海 */
   const b = await iceOrder(env, PORT + 12, 'hk');
-  check('turn=hk → 只下发香港', turnHosts(b.ice).join(',') === 'hk.example.com', turnHosts(b.ice).join(','));
-  check('turn=hk → line=hk', !!(b.ice && b.ice.line === 'hk'), String(b.ice && b.ice.line));
+  check('旧 turn=hk 仍固定上海', turnHosts(b.ice).join(',') === '203.0.113.20', turnHosts(b.ice).join(','));
+  check('旧 turn=hk 不改变线路', !!(b.ice && b.ice.line === 'sh'), String(b.ice && b.ice.line));
 
-  /* 3. P2P：不给任何 TURN */
-  const c = await iceOrder(env, PORT + 13, 'p2p');
-  check('turn=p2p → 没有任何 TURN 条目', turnHosts(c.ice).length === 0, turnHosts(c.ice).join(','));
-  check('turn=p2p → line=p2p', !!(c.ice && c.ice.line === 'p2p'), String(c.ice && c.ice.line));
-  check('turn=p2p → 仍然下发 STUN', JSON.stringify(c.ice || {}).includes('stun:stun.l.google.com'));
-
-  /* 4. 不存在的线路退回默认，不会连不上 */
-  const d = await iceOrder(env, PORT + 14, 'nope');
-  check('未知线路 → 退回默认', !!(d.ice && d.ice.line === 'sh'), String(d.ice && d.ice.line));
-
-  /* 5. 老变量仍然可用（TURN_HOST / TURN_LABEL） */
+  /* 3. 老变量仍然可用（TURN_HOST / TURN_LABEL） */
   const e = await iceOrder({
     TURN_HOST: 'hk.example.com',
     TURN_PORT: '3478',
@@ -502,45 +488,30 @@ async function testLines() {
     TURN_LABEL: '香港'
   }, PORT + 15);
   check('老变量 TURN_HOST 变成一条线路', !!(e.ice && e.ice.line === 'main'), String(e.ice && e.ice.line));
-  check('TURN_LABEL 作为标题', JSON.stringify(e.ice || {}).includes('香港'));
+  check('TURN_LABEL 作为固定线路配置', turnHosts(e.ice).join(',') === 'hk.example.com');
   check('老变量只下发这一个 host', turnHosts(e.ice).join(',') === 'hk.example.com', turnHosts(e.ice).join(','));
 
-  /* 6. 完全没配 TURN：只剩 P2P */
+  /* 4. 未配置 TURN 时保持无可用中继，客户端不能回退 P2P */
   const f = await iceOrder({}, PORT + 16);
-  check('未配 TURN → 线路只有 P2P', lineIds(f.ice).join(',') === 'p2p', lineIds(f.ice).join(','));
-  check('未配 TURN → 没有 TURN 条目', turnHosts(f.ice).length === 0);
+  check('未配 TURN → 无线路', lineIds(f.ice).length === 0, lineIds(f.ice).join(','));
+  check('未配 TURN → relay 策略', f.ice && f.ice.iceTransportPolicy === 'relay');
 
-  /* 7. 强制中继策略：选 TURN → relay，选 P2P → all */
+  /* 5. 固定上海始终强制 relay */
   const g = await iceOrder(env, PORT + 17, 'sh');
-  check('选上海 → iceTransportPolicy=relay', !!(g.ice && g.ice.iceTransportPolicy === 'relay'),
+  check('固定上海 → iceTransportPolicy=relay', !!(g.ice && g.ice.iceTransportPolicy === 'relay'),
     String(g.ice && g.ice.iceTransportPolicy));
-  const h = await iceOrder(env, PORT + 18, 'p2p');
-  check('选 P2P → iceTransportPolicy=all', !!(h.ice && h.ice.iceTransportPolicy === 'all'),
-    String(h.ice && h.ice.iceTransportPolicy));
-  check('P2P 仍带各节点的纯 STUN（内地打洞兜底）',
-    JSON.stringify(h.ice || {}).includes('203.0.113.20') && !turnHosts(h.ice).length,
-    JSON.stringify(h.ice || {}).slice(0, 200));
 
-  /* 8. 主播端按观众线路动态取用：ice 本身保留默认线路做兼容，byLine 带全部线路 */
-  const i = await iceOrder(env, PORT + 19, 'hk', 'host');
+  /* 6. 主播与观众都使用同一上海 ICE 配置 */
+  const i = await iceOrder(env, PORT + 19, '', 'host');
   check('主播端 welcome 的 ice 仍保留默认线路（兼容旧前端）',
     !!(i.ice && i.ice.line === 'sh') && turnHosts(i.ice).join(',') === '203.0.113.20',
     JSON.stringify({ line: i.ice && i.ice.line, hosts: turnHosts(i.ice) }));
-  check('主播端收到每条线路的 ICE 配置',
-    !!(i.ice && i.ice.byLine && i.ice.byLine.p2p && i.ice.byLine.sh && i.ice.byLine.hk),
-    Object.keys((i.ice && i.ice.byLine) || {}).join(','));
-  check('主播逐线路策略：p2p=all，sh/hk=relay',
-    !!(i.ice.byLine.p2p.iceTransportPolicy === 'all'
-      && i.ice.byLine.sh.iceTransportPolicy === 'relay'
-      && i.ice.byLine.hk.iceTransportPolicy === 'relay'));
-  check('主播逐线路只带各自的 TURN',
-    turnHosts(i.ice.byLine.sh).join(',') === '203.0.113.20'
-    && turnHosts(i.ice.byLine.hk).join(',') === 'hk.example.com'
-    && turnHosts(i.ice.byLine.p2p).length === 0,
-    `${turnHosts(i.ice.byLine.sh)} / ${turnHosts(i.ice.byLine.hk)} / ${turnHosts(i.ice.byLine.p2p)}`);
+  check('主播端使用固定上海 ICE',
+    !!(i.ice && i.ice.iceTransportPolicy === 'relay' && turnHosts(i.ice).join(',') === '203.0.113.20'),
+    JSON.stringify({ policy: i.ice && i.ice.iceTransportPolicy, hosts: turnHosts(i.ice) }));
 }
 
-/* 观众换线路时，服务端要告诉主播换哪一路 peer 的 ICE 配置 */
+/* 固定线路后，旧版 viewer 重新连接也不会触发线路切换事件。 */
 async function testDynamicHostLines() {
   const port = PORT + 20;
   const srv = spawnServer({
@@ -569,7 +540,7 @@ async function testDynamicHostLines() {
     v2 = await sse('role=viewer&id=dv1&name=V&turn=p2p', port);
     await v2.waitFor('welcome');
     const switched = await host.waitFor('viewer-line');
-    check('观众切线路 → 主播收到 viewer-line', !!(switched && switched.data.id === 'dv1' && switched.data.line === 'p2p'),
+    check('旧版切换参数仍固定上海', !!(switched === null || (switched && switched.data.line === 'sh')),
       switched ? JSON.stringify(switched.data) : 'no event');
 
     await req('POST', '/api/stream', { id: 'dh', live: true }, null, port);
@@ -577,7 +548,7 @@ async function testDynamicHostLines() {
     const goEvt = host.events.filter((e) => e.event === 'go-live').pop();
     check('go-live 的观众列表带线路信息',
       !!(goEvt && Array.isArray(goEvt.data.viewers)
-        && goEvt.data.viewers.some((v) => v.id === 'dv1' && v.line === 'p2p')),
+        && goEvt.data.viewers.some((v) => v.id === 'dv1' && v.line === 'sh')),
       goEvt ? JSON.stringify(goEvt.data.viewers) : 'no event');
   } finally {
     for (const c of [host, v1, v2]) { try { if (c) c.close(); } catch (err) { /* noop */ } }

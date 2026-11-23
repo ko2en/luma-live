@@ -4,8 +4,11 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>LUMA · 开播控制台</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%237c3aed'/%3E%3Crect x='11' y='11' width='10' height='10' rx='2' fill='%2308080b'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/styles.css?v=15" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23111'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23e8462f'/%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://registry.npmmirror.com" crossorigin>
+<link rel="stylesheet" href="https://registry.npmmirror.com/lxgw-wenkai-webfont/1.7.0/files/lxgwwenkai-regular.css">
+<link rel="stylesheet" href="https://registry.npmmirror.com/lxgw-wenkai-webfont/1.7.0/files/lxgwwenkai-bold.css">
+<link rel="stylesheet" href="/styles.css?v=24" />
 </head>
 <body>
 <div class="ambient"></div>
@@ -30,6 +33,7 @@
       观看页
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M7 17 17 7M9 7h8v8"/></svg>
     </a>
+    <span class="auth-slot" data-auth hidden></span>
   </div>
 </header>
 
@@ -51,8 +55,8 @@
       <div class="taken-over" data-taken-over hidden>
         <div class="taken-over-inner">
           <span class="taken-tag">已被接管</span>
-          <strong>已在别处开播</strong>
-          <p>同一个开播口令只允许一台开播端在线。这个标签页已经停播，摄像头和麦克风也已释放。</p>
+          <strong>这个账号已在别处使用</strong>
+          <p>同一个账号同时只允许一处观看或开播。这个标签页已经停播，摄像头和麦克风也已释放。</p>
           <div class="preview-actions">
             <button class="solid-btn" data-take-over type="button">在这里继续开播</button>
             <a class="line-btn" href="/" target="_blank" rel="noopener">去观众页看看</a>
@@ -119,11 +123,6 @@
       <div class="action-row">
         <button class="go-live-btn" data-go-live type="button" disabled>准备中…</button>
       </div>
-
-      <div class="status-note">
-        <span class="bullet"></span>
-        <span data-hint>先说清楚：这是点对点直连，没有中心服务器转码。主播上行带宽 = 每位观众一份，适合几十人以内的自留地直播。</span>
-      </div>
     </div>
   </div>
 
@@ -132,11 +131,12 @@
       <h3>直播状态</h3>
       <div class="kv"><span class="k">状态</span><span class="v" data-st-status>未开播</span></div>
       <div class="kv"><span class="k">同时在看</span><span class="v" data-st-viewers>0</span></div>
+      <div class="kv kv-audience"><span class="k">在场观众</span><span class="v" data-st-audience>—</span></div>
       <div class="kv"><span class="k">本场时长</span><span class="v" data-st-time>00:00:00</span></div>
       <div class="kv"><span class="k">采集画面</span><span class="v" data-st-res>—</span></div>
       <div class="kv"><span class="k">实际发送</span><span class="v" data-st-send>—</span></div>
       <div class="kv"><span class="k">声音</span><span class="v" data-st-audio>无</span></div>
-      <div class="kv"><span class="k">连接方式</span><span class="v" data-st-connections aria-live="polite">P2P 0路 / TURN 0路</span></div>
+      <div class="kv"><span class="k">连接方式</span><span class="v" data-st-connections aria-live="polite">TURN 0路</span></div>
       <div class="kv"><span class="k">上行码率</span><span class="v" data-st-bitrate>—</span></div>
     </div>
 
@@ -157,23 +157,14 @@
         <li>首次开播浏览器会分别询问摄像头和麦克风权限，都要选「允许」。</li>
         <li>麦克风没反应：看下方电平表有没有跳动；不动就换一个「麦克风来源」，或点地址栏图标恢复权限。</li>
         <li>要共享电脑里播放的声音，共享时选「标签页」并勾选「分享标签页音频」。</li>
-        <li>掉线后重新开播，观众端会自动重新接入。</li>
-        <li>刷新页面不会中断直播：服务端会等你 10 秒，重连上就继续，超时才结束本场。</li>
-        <li>优先保持 30 fps；网络或编码吃紧时，逐路降低分辨率和码率，稳定后再升回来。实际帧率以状态栏为准。</li>
-      </ul>
-    </div>
-    <div class="side-card">
-      <h3>安全</h3>
-      <ul class="tips">
-        <li>服务端设了 <code>STREAM_KEY</code> 时，开播前需要在上方填「开播口令」，口令只存在本机浏览器里。</li>
-        <li>观众不需要口令，打开链接就能看。</li>
-        <li>没设口令时谁都能打开这个页面开播——公网部署务必设置。</li>
+        <li>所有画面都经本站 TURN 服务器中转，不受 NAT 和公司网络限制；刷新页面后 10 秒内重连可接着播。</li>
       </ul>
     </div>
   </aside>
 </main>
 
 <div class="toast" data-toast></div>
-<script src="/studio.js?v=18"></script>
+<script src="/studio.js?v=25"></script>
+<script src="/auth-ui.js?v=2"></script>
 </body>
 </html>

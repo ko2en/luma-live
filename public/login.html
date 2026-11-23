@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>LUMA · 登录</title>
+<meta name="robots" content="noindex, nofollow" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23111'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23e8462f'/%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://registry.npmmirror.com" crossorigin>
+<link rel="stylesheet" href="https://registry.npmmirror.com/lxgw-wenkai-webfont/1.7.0/files/lxgwwenkai-regular.css">
+<link rel="stylesheet" href="https://registry.npmmirror.com/lxgw-wenkai-webfont/1.7.0/files/lxgwwenkai-bold.css">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<style>
+  :root{
+    --paper:#f4f4f1; --ink:#111; --mark:#e8462f; --line:rgba(17,17,17,.2);
+    --line-soft:rgba(17,17,17,.12); --muted:rgba(17,17,17,.52); --faint:rgba(17,17,17,.36);
+    --panel:#fff; --field:#f7f7f4;
+    --r-sm:10px; --r-btn:12px; --r-card:24px;
+    --shadow-1:0 1px 2px rgba(17,17,17,.035),0 8px 18px -14px rgba(17,17,17,.22);
+    --shadow-2:0 1px 3px rgba(17,17,17,.07),0 18px 34px -26px rgba(17,17,17,.45);
+    --cn:"LXGW WenKai","PingFang SC","Microsoft YaHei",sans-serif;
+    --mono:"SFMono-Regular",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  [hidden]{display:none!important}
+  html,body{min-height:100%}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:"Helvetica Neue",Helvetica,Arial,"LXGW WenKai","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:14px; -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    display:flex; flex-direction:column;
+  }
+  .topbar{
+    display:flex; align-items:center; gap:10px;
+    height:58px; padding:0 clamp(16px,4vw,64px);
+    border-bottom:1px solid var(--line); background:rgba(244,244,241,.94);
+  }
+  .brand-mark{width:22px;height:22px;display:grid;place-items:center}
+  .brand-mark svg{width:19px;height:19px;display:block}
+  .brand-mark svg rect{fill:var(--ink)}
+  .brand-word{font-size:13px;font-weight:700;letter-spacing:.22em}
+  .main{flex:1;display:grid;place-items:center;padding:40px 20px 80px}
+  .card{
+    width:100%;max-width:396px;
+    background:var(--panel);border:1px solid var(--line-soft);border-radius:var(--r-card);
+    padding:34px 30px 30px;box-shadow:var(--shadow-2);
+  }
+  .eyebrow{
+    font-family:var(--mono); font-size:10px; letter-spacing:.24em;
+    color:var(--mark); display:flex; align-items:center; gap:9px; margin-bottom:20px;
+  }
+  .eyebrow::before{content:"";width:22px;height:1px;background:var(--mark)}
+  h1{
+    font-family:var(--cn); font-weight:700; font-size:30px; line-height:1.25;
+    margin:0 0 12px; letter-spacing:.01em;
+  }
+  .sub{font-family:var(--cn);font-size:13px;color:var(--muted);margin:0 0 36px;line-height:1.7}
+  .field{margin-bottom:18px}
+  .field label{
+    display:block; font-family:var(--cn); font-size:11px; letter-spacing:.16em;
+    color:var(--muted); margin-bottom:9px;
+  }
+  .field input{
+    width:100%; height:46px; padding:0 13px;
+    background:var(--field); color:var(--ink);
+    border:1px solid var(--line-soft); border-radius:var(--r-btn);
+    font-family:var(--cn); font-size:15px; outline:none;
+    transition:border-color .15s ease, box-shadow .15s ease, background .15s ease;
+  }
+  .field input:focus{
+    border-color:var(--mark); background:var(--panel);
+    box-shadow:0 0 0 3px rgba(232,70,47,.12);
+  }
+  .field input::placeholder{color:var(--faint)}
+  .error{
+    font-family:var(--cn); font-size:12px; color:var(--mark);
+    min-height:18px; margin:-4px 0 14px;
+  }
+  .submit{
+    width:100%; height:48px; border:1px solid var(--ink);
+    background:var(--ink); color:var(--paper);
+    border-radius:var(--r-btn); box-shadow:0 2px 0 rgba(17,17,17,.18);
+    font-family:var(--cn); font-size:13px; letter-spacing:.16em;
+    transition:.18s ease;
+  }
+  .submit:hover:not(:disabled){
+    background:var(--mark); border-color:var(--mark);
+    transform:translateY(-1px); box-shadow:0 8px 18px -10px rgba(232,70,47,.7);
+  }
+  .submit:active:not(:disabled){transform:none;box-shadow:none}
+  .submit:disabled{opacity:.5;cursor:default;box-shadow:none}
+  .foot{
+    text-align:center; font-family:var(--mono); font-size:10px;
+    letter-spacing:.16em; color:var(--faint); padding:0 20px 28px;
+  }
+  .foot a{color:var(--muted);border-bottom:1px solid var(--line-soft)}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <span class="brand-mark" aria-hidden="true">
+    <svg viewBox="0 0 24 24"><rect x="4" y="13" width="3.4" height="7" rx="1.2" opacity=".55"/><rect x="10.3" y="8.5" width="3.4" height="11.5" rx="1.2" opacity=".82"/><rect x="16.6" y="4" width="3.4" height="16" rx="1.2"/></svg>
+  </span>
+  <span class="brand-word">LUMA</span>
+</header>
+
+<main class="main">
+  <div class="card">
+    <div class="eyebrow">PRIVATE ACCESS</div>
+    <h1>授信访问</h1>
+    <p class="sub">直播间仅对授信用户开放。请使用管理员发给你的账号登录，之后即可观看与开播。</p>
+
+    <form data-login autocomplete="on">
+      <div class="field">
+        <label for="user">账号</label>
+        <input id="user" name="user" type="text" autocomplete="username" placeholder="你的账号" required autofocus />
+      </div>
+      <div class="field">
+        <label for="pass">密码</label>
+        <input id="pass" name="pass" type="password" autocomplete="current-password" placeholder="••••••••" required />
+      </div>
+      <div class="error" data-error aria-live="polite"></div>
+      <button class="submit" type="submit" data-submit>登 录</button>
+    </form>
+  </div>
+</main>
+
+<div class="foot"><a href="/">← 返回首页</a></div>
+
+<script src="/login.js"></script>
+</body>
+</html>

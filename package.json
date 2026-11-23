@@ -1,6 +1,6 @@
 {
   "name": "luma-live",
-  "version": "1.7.0",
+  "version": "1.2.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,8 +15,7 @@
     "test:studio": "node scripts/test-studio-key.js",
     "test:e2e": "node scripts/test-e2e.js",
     "test:relay": "node scripts/test-relay.js",
-    "test:video": "node scripts/test-video-adaptation.js",
-    "test:single-host": "bash scripts/test-single-host.sh"
+    "test:video": "node scripts/test-video-adaptation.js"
   },
   "engines": {
     "node": ">=18"
