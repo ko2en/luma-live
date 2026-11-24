@@ -6,6 +6,7 @@
  */
 
 const http = require('http');
+const fs = require('fs');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const path = require('path');
@@ -395,6 +396,21 @@ async function testTurn() {
     for (const body of [[], 'text', 7, true]) {
       check(`非对象 JSON ${JSON.stringify(body)} → 400`, (await req('POST', '/api/chat', body)).status === 400);
     }
+    /* 头像读取走 fs.readFile 回调，里面用了 MIME 表：漏导入会让整个进程崩掉。
+       这条曾经在线上真实发生过（NRestarts 一路涨），必须守住。 */
+    const avatarDir = path.join(__dirname, '..', 'data', 'avatars');
+    const avatarName = `${'a'.repeat(32)}.png`;
+    fs.mkdirSync(avatarDir, { recursive: true });
+    fs.writeFileSync(path.join(avatarDir, avatarName),
+      Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex'));
+    const avatarRes = await req('GET', `/api/avatar/${avatarName}`);
+    check('头像读取 200', avatarRes.status === 200, `status=${avatarRes.status}`);
+    check('头像 Content-Type 为 image/png',
+      String(avatarRes.headers['content-type'] || '').includes('image/png'),
+      String(avatarRes.headers['content-type'] || '-'));
+    check('头像读取后进程仍存活', (await req('GET', '/api/state')).status === 200);
+    fs.unlinkSync(path.join(avatarDir, avatarName));
+
     const anonymous = await req('POST', '/api/chat', { text: '匿名仍兼容', role: 'host' });
     check('无 id 匿名聊天兼容且不能指定主播身份', anonymous.status === 200 && anonymous.body.msg.role === 'viewer');
 

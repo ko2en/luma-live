@@ -16,7 +16,7 @@ const config = require('./src/config');
 const { safeEqual } = require('./src/util');
 const { pickLine, icePayload } = require('./src/turn');
 const {
-  json, readBody, addCookie, secureCookie,
+  MIME, json, readBody, addCookie, secureCookie,
   applySecurityHeaders, crossSiteWrite, serveStatic
 } = require('./src/http');
 const {
