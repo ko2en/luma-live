@@ -3,6 +3,9 @@
 
   const $ = (sel, root = document) => root.querySelector(sel);
 
+  /* 采集与发送的目标帧率：60fps 更顺，但对带宽与编码更吃紧（码率相应提到 2.8Mbps） */
+  const VIDEO_TARGET_FPS = 60;
+
   /* ICE 默认值：未收到服务端配置时使用，媒体固定走中继（relay）。
      服务端 welcome 里下发 iceServers 时会被覆盖，换机房只改环境变量。 */
   const ICE = {
@@ -544,7 +547,7 @@
     }
 
     try {
-      const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } };
+      const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: VIDEO_TARGET_FPS, max: VIDEO_TARGET_FPS } };
       if (deviceId) video.deviceId = { exact: deviceId };
 
       const stream = await withTimeout(
@@ -794,13 +797,13 @@
       let stream;
       try {
         stream = await navigator.mediaDevices.getDisplayMedia({
-          video: { frameRate: { ideal: 30, max: 30 } },
+          video: { frameRate: { ideal: VIDEO_TARGET_FPS, max: VIDEO_TARGET_FPS } },
           audio: true,
           systemAudio: 'include',
           selfBrowserSurface: 'exclude'
         });
       } catch (err) {
-        stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } }, audio: true });
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: VIDEO_TARGET_FPS } }, audio: true });
       }
 
       // 系统声音原样送出去，不要做降噪/回声消除
@@ -1244,8 +1247,9 @@
 
   /* 每个观众一条独立 RTCPeerConnection，天然可以单独设档。
      观众端每 3 秒回报一次丢包/RTT，这里据此调该观众的码率上限。 */
-  /* 固定发送参数：不按网络分级，所有观众统一 720p/30fps/1200kbps。 */
-  const FIXED_BITRATE = 1200000;
+  /* 固定发送参数：不按网络分级，所有观众统一 720p/60fps/2.8Mbps。
+     60fps 需要更多码率喂饱，1.2Mbps 会把高帧率的效果全吃掉（帧多但每帧更糊）。 */
+  const FIXED_BITRATE = 2800000;
   const TIER_RANK = { low: 0, mid: 1, high: 2 };
 
   function tierFor(stats) {
@@ -1275,7 +1279,6 @@
   }
 
   const VIDEO_LONG_EDGE = [1280, 960, 640];
-  const VIDEO_TARGET_FPS = 30;
   const VIDEO_SWITCH_COOLDOWN = 10000;
 
   // replaceTrack 与 get/setParameters 共用队列，避免旧 transactionId 引发
@@ -1363,7 +1366,7 @@
       limited = limited || r.qualityLimitationReason === 'cpu' || r.qualityLimitationReason === 'bandwidth';
       const captureFps = sources.has(r.mediaSourceId)
         ? sources.get(r.mediaSourceId) : (sources.size === 1 ? sources.values().next().value : null);
-      sourceReady = sourceReady || (captureFps !== null && captureFps >= 26);
+      sourceReady = sourceReady || (captureFps !== null && captureFps >= VIDEO_TARGET_FPS * 0.85);
     });
     state.samples = samples;
     state.resolutions = Array.from(resolutions);
@@ -1375,10 +1378,10 @@
     }
 
     // 静态屏幕、低帧率摄像头或缺失采集统计时，不把源端缺帧误判为编码压力。
-    // 明确的 CPU/带宽限制仍可降档；30fps 是目标，不是设备/网络上的下限承诺。
-    const bad = limited || (fps < 26 && sourceReady);
+    // 明确的 CPU/带宽限制仍可降档；目标帧率不是设备/网络上的下限承诺。
+    const bad = limited || (fps < VIDEO_TARGET_FPS * 0.85 && sourceReady);
     state.bad = bad ? state.bad + 1 : 0;
-    state.good = fps >= 29 && !limited ? state.good + 1 : 0;
+    state.good = fps >= VIDEO_TARGET_FPS - 2 && !limited ? state.good + 1 : 0;
     if (now - state.switchedAt < VIDEO_SWITCH_COOLDOWN) return;
     const baseline = 2 - TIER_RANK[pc.__tier || 'high'];
     return; /* 固定发送档位：不再根据视频统计调整分辨率 */
@@ -1417,7 +1420,7 @@
       try { pc.addTrack(track, localStream); } catch (err) { /* noop */ }
     });
 
-    // 采集与发送均以 30fps 为目标；带宽/编码压力下优先牺牲本路分辨率。
+    // 采集与发送均以目标帧率为准；带宽/编码压力下优先牺牲本路分辨率。
     await tunePeer(pc);
     if (!isCurrent()) return;
 
@@ -1688,7 +1691,7 @@
 
     if (!peers.size || !live) {
       el.stBitrate.textContent = '—';
-      if (el.stSend) el.stSend.textContent = live ? '等待观众 · 目标30 fps' : '—';
+      if (el.stSend) el.stSend.textContent = live ? `等待观众 · 目标${VIDEO_TARGET_FPS} fps` : '—';
       lastBytes = null;
       return;
     }
