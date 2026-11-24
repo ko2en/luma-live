@@ -20,7 +20,7 @@ jobs:
 
       - name: 语法检查（JS）
         run: |
-          for f in server.js src/*.js scripts/*.js; do
+          for f in server.js src/*.js public/*.js scripts/*.js; do
             node --check "$f"
           done
 
