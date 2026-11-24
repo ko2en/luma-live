@@ -1247,9 +1247,10 @@
 
   /* 每个观众一条独立 RTCPeerConnection，天然可以单独设档。
      观众端每 3 秒回报一次丢包/RTT，这里据此调该观众的码率上限。 */
-  /* 固定发送参数：不按网络分级，所有观众统一 720p/60fps/2.8Mbps。
-     60fps 需要更多码率喂饱，1.2Mbps 会把高帧率的效果全吃掉（帧多但每帧更糊）。 */
-  const FIXED_BITRATE = 2800000;
+  /* 固定发送参数：不按网络分级，所有观众统一 720p/60fps/5Mbps。
+     720p60 在 2.8Mbps 下遇到快速运动仍会糊，5Mbps 留给编码器足够余量；
+     代价是每位观众都占一份上行与中继带宽，人多时要留意。 */
+  const FIXED_BITRATE = 5000000;
   const TIER_RANK = { low: 0, mid: 1, high: 2 };
 
   function tierFor(stats) {
